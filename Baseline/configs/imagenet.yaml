@@ -7,7 +7,7 @@
 # ----------------------------------------------------------------------------
 dataset:
   name: imagenet
-  data_root: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/imagenet/images
+  data_root: /path/to/project/DATA/imagenet/images
   num_classes: 1000          # 类别数
   num_workers: 8           # 数据加载进程数
   preprocess: Base         # 预处理方案（Base=224, STN=448）；

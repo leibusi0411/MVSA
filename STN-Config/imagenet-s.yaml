@@ -4,7 +4,7 @@
 # === 基础模型配置 ===
 model_size: ViT-B/16       # CLIP模型大小
 dataset: imagenet-s        # 数据集名称
-data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/ImageNet-Sketch   # 修改为你的ImageNet-Sketch数据集路径
+data_path: /path/to/project/DATA/ImageNet-Sketch   # 修改为你的ImageNet-Sketch数据集路径
 
 # === STN核心配置 ===
 stn_config:

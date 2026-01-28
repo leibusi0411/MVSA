@@ -4,7 +4,7 @@
 # === 基础模型配置 ===
 model_size: ViT-B/32       # CLIP模型大小
 dataset: fgvc-aircraft     # 数据集名称
-data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA # 数据集根目录（代码会自动添加fgvc-aircraft-2013b）
+data_path: /path/to/project/DATA # 数据集根目录（代码会自动添加fgvc-aircraft-2013b）
 
 # === STN核心配置 ===
 stn_config:

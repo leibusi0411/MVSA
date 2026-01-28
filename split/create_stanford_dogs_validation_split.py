@@ -25,7 +25,7 @@ def get_stanford_dogs_data_root():
     # - lists/: 包含train_list.mat, test_list.mat
     # - images/: 包含120个品种子目录
     # - annotation/: 包含标注文件
-    return '/mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/stanford_dogs'
+    return '/path/to/project/DATA/stanford_dogs'
 
 
 def read_train_mat_file(data_root):
@@ -271,7 +271,7 @@ def main():
     parser = argparse.ArgumentParser(description='创建Stanford Dogs数据集的验证集划分')
     parser.add_argument('--data_root', type=str, default=None, 
                         help='数据集根目录路径 (包含train_list.mat的目录)')
-    parser.add_argument('--output_dir', type=str, default='/mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/stanford_dogs/splits',
+    parser.add_argument('--output_dir', type=str, default='/path/to/project/DATA/stanford_dogs/splits',
                         help='输出目录路径')
     parser.add_argument('--val_ratio', type=float, default=0.2,
                         help='验证集比例 (默认: 0.2)')

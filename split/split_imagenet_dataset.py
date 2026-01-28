@@ -7,7 +7,7 @@ ImageNet数据集训练集划分工具
 3. 从原始训练集中删除这些图片
 
 使用方法：
-python split_imagenet_dataset.py --train_dir /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/imagenet/images/train  --val_dir /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/imagenet/images/val --samples_per_class 50
+python split_imagenet_dataset.py --train_dir /path/to/project/DATA/imagenet/images/train  --val_dir /path/to/project/DATA/imagenet/images/val --samples_per_class 50
 
 注意事项：
 - 操作会直接移动文件，请确保有备份
