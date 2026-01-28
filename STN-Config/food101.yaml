@@ -1,0 +1,64 @@
+# STN专用配置文件 - Food-101 食物分类数据集
+# 针对食物图像优化，仅包含STN训练所需参数
+
+# === 基础模型配置 ===
+model_size: ViT-B/32    # CLIP模型大小
+dataset: food101            # 数据集名称
+data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/WCA/data    # 数据集路径
+
+# === STN核心配置 ===
+stn_config:
+  # 网络架构参数
+  hidden_dim: 256          # 注意力和MLP的隐藏维度
+  num_heads: 8             # 多头注意力的头数
+  dropout: 0.15            # 食物图像变化较大，增加dropout
+  patch_layer: -2          # 提取patch特征的ViT层
+  num_views: 4          # 多视角STN的视角数量
+  fusion_mode: transformer      # 特征融合模式: simple(简单平均), weighted(相似度加权), concat(拼接降维), transformer(Transformer融合)
+  
+  # Transformer融合配置（当fusion_mode=transformer时生效）
+  transformer_heads: 8      # Transformer注意力头数
+  transformer_layers: 2     # Transformer编码器层数
+  transformer_dropout: 0.15 # Transformer的Dropout概率（Food101使用稍高的dropout）
+
+  # 多视角STN损失配置
+  
+  # 核心损失权重（多视角STN主要损失）
+  classification_weight: 1.0    # 标准分类损失权重（交叉熵损失）
+  contrastive_weight: 0.0       # 对比损失权重（CLIP风格对比损失）
+  decorrelation_weight: 0.5     # 特征去相关损失权重（鼓励视角特征互补）
+  adaptive_weight: 0.5          # 自适应分类损失权重（动态平衡视角训练）
+  logits_temp: 0.07             # 温度参数（CLIP标准值，用于相似度计算和对比损失）
+  
+
+
+# === 训练配置 ===
+training:
+  # 基础训练参数
+  epochs: 100              # 训练轮数
+  batch_size: 48      # 批次大小 (从32增加到48，利用显存余量)
+  num_workers: 8           # 数据加载进程数 (从4增加到8，提升数据加载速度)
+  
+  # 优化器配置（食物分类数据集，统一使用AdamW）
+  optimizer: adamw         # 优化器类型: adamw (统一使用)
+  learning_rate: 1e-4      # 学习率（AdamW适用）
+  weight_decay: 1e-2       # L2正则化权重衰减（AdamW推荐值）
+  beta1: 0.9               # AdamW beta1参数
+  beta2: 0.999             # AdamW beta2参数
+  eps: 1e-8                # AdamW epsilon参数
+  mixed_precision: false   # 禁用混合精度训练，使用float32提高数值稳定性
+  
+  # 早停配置
+  patience: 5             # 早停耐心值：验证损失15个epoch不下降后停止训练
+  
+  # 学习率调度配置（统一使用CosineAnnealingLR）
+  eta_min: 1e-6            # 最小学习率：余弦退火的最小值
+  
+  # 学习率预热配置
+  warmup_epochs: 5         # 预热轮数：前5个epoch使用较小学习率逐渐增加
+  warmup_factor: 0.1       # 预热起始因子：起始学习率为目标学习率的10%
+  
+  # 梯度裁剪配置
+  max_grad_norm: 1.0       # 梯度裁剪阈值：强大且稳健的默认值
+  grad_norm_type: 2.0      # 梯度范数类型：L2范数（默认值）
+

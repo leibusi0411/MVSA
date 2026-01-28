@@ -221,23 +221,71 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
+        """
+        Vision Transformer前向传播过程
+        
+        Args:
+            x: 输入图像张量，形状为 [batch_size, 3, height, width]
+            
+        Returns:
+            cls_token: CLS token特征，形状为 [batch_size, embed_dim]
+            patch_tokens: 图像块特征，形状为 [batch_size, num_patches, width]
+        """
+        
+        # 步骤1: 图像分块和线性投影
+        # 将图像分割成固定大小的patch，并通过卷积层进行线性投影
+        x = self.conv1(x)  # shape = [batch_size, width, grid, grid]
+        # 其中 grid = image_size // patch_size，width 是 transformer 的隐藏维度
+        
+        # 步骤2: 展平空间维度
+        # 将2D的patch网格展平为1D序列
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [batch_size, width, grid**2]
+        
+        # 步骤3: 调整维度顺序
+        # 从 [batch, channels, patches] 转换为 [batch, patches, channels]
+        x = x.permute(0, 2, 1)  # shape = [batch_size, grid**2, width]
+        # 现在每个patch都是一个width维的向量
+        
+        # 步骤4: 添加CLS token
+        # 在序列开头添加可学习的CLS token，用于表示整个图像的全局特征
+        cls_embedding = self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        x = torch.cat([cls_embedding, x], dim=1)  # shape = [batch_size, grid**2 + 1, width]
+        # 序列结构: [CLS, patch1, patch2, ..., patchN]
+        
+        # 步骤5: 添加位置编码
+        # 为每个位置（CLS + patches）添加位置信息
         x = x + self.positional_embedding.to(x.dtype)
+        # positional_embedding shape = [grid**2 + 1, width]
+        
+        # 步骤6: 预层归一化
+        # 在进入transformer之前进行层归一化
         x = self.ln_pre(x)
-
-        x = x.permute(1, 0, 2)  # NLD -> LND
+        
+        # 步骤7: 调整维度以适配transformer
+        # Transformer期望输入格式为 [sequence_length, batch_size, hidden_dim]
+        x = x.permute(1, 0, 2)  # NLD -> LND: [grid**2 + 1, batch_size, width]
+        
+        # 步骤8: 通过transformer层
+        # 多层自注意力机制处理序列  通过多层自注意力机制处理序列，提取图像的全局特征和局部特征
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-
-        x = self.ln_post(x[:, 0, :])
-
+        
+        # 步骤9: 恢复维度顺序
+        # 从 [sequence, batch, hidden] 转回 [batch, sequence, hidden]
+        x = x.permute(1, 0, 2)  # LND -> NLD: [batch_size, grid**2 + 1, width]
+        
+        # 步骤10: 提取CLS token和patch tokens
+        cls_token = self.ln_post(x[:, 0, :])  # 取第0个位置(CLS token)并进行后层归一化
+        patch_tokens = x[:, 1:, :]  # 取第1到最后位置(所有patch tokens)，不进行层归一化
+        
+        # 步骤11: 特征投影
         if self.proj is not None:
-            x = x @ self.proj
+            # 将CLS token投影到最终的嵌入空间
+            cls_token = cls_token @ self.proj  # [batch_size, width] @ [width, embed_dim] -> [batch_size, embed_dim]
+            # 注意：patch tokens保持原始维度，未进行投影
+            # 如果需要投影patch tokens，可以取消下面的注释
+            # patch_tokens = patch_tokens @ self.proj  # [batch_size, num_patches, embed_dim]
 
-        return x
+        return cls_token, patch_tokens
 
 
 class CLIP(nn.Module):
@@ -339,6 +387,7 @@ class CLIP(nn.Module):
 
     def encode_image(self, image):
         return self.visual(image.type(self.dtype))
+
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]

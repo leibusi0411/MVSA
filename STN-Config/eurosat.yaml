@@ -1,0 +1,61 @@
+# STN专用配置文件 - EuroSAT 卫星土地利用分类数据集
+# 针对遥感图像优化
+
+# === 基础模型配置 ===
+model_size: ViT-B/16    # CLIP模型大小
+dataset: eurosat        # 数据集名称
+data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/eurosat   # 数据集路径
+
+# === STN核心配置 ===
+stn_config:
+  # 网络架构参数
+  hidden_dim: 256          # 注意力和MLP的隐藏维度
+  num_heads: 8             # 多头注意力的头数
+  dropout: 0.1             # 卫星图像通常特征较明显，标准dropout即可
+  patch_layer: -2          # 提取patch特征的ViT层
+  num_views: 2             # 多视角STN的视角数量
+  fusion_mode: transformer # 特征融合模式
+  
+  # Transformer融合配置
+  transformer_heads: 8      
+  transformer_layers: 2     
+  transformer_dropout: 0.1 
+
+  # 多视角STN损失配置
+  classification_weight: 1.0    
+  contrastive_weight: 0.0       
+  decorrelation_weight: 0.5     
+  adaptive_weight: 0.5          
+  logits_temp: 0.07             
+  
+
+
+# === 训练配置 ===
+training:
+  # 基础训练参数
+  epochs: 100              # 训练轮数
+  batch_size: 64           # 批次大小 
+  num_workers: 4           # 数据加载进程数
+  
+  # 优化器配置
+  optimizer: adamw         
+  learning_rate: 1e-4      
+  weight_decay: 1e-2       
+  beta1: 0.9               
+  beta2: 0.999             
+  eps: 1e-8                
+  mixed_precision: false   
+  
+  # 早停配置
+  patience: 10             # EuroSAT相对较小，可能波动，稍微增加耐心值
+  
+  # 学习率调度配置
+  eta_min: 1e-6            
+  
+  # 学习率预热配置
+  warmup_epochs: 5         
+  warmup_factor: 0.1       
+  
+  # 梯度裁剪配置
+  max_grad_norm: 1.0       
+  grad_norm_type: 2.0      

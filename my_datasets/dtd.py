@@ -1,3 +1,6 @@
+#分割文件中没有定义标签，分割文件中只有所含的图片文件名，是按字母排序分配的数字标签  从0开始
+#有多个分割文件，每个分割文件中包含类名和图片的文件名    banded/banded_0001.jpg  类别名/文件名.jpg
+#支持三种分割：train、val、test，有独立的验证集
 import os
 import pathlib
 from typing import Optional, Callable
@@ -42,7 +45,7 @@ class DTD(VisionDataset):
         self,
         root: str,
         split: str = "train",
-        partition: int = 1,
+        partition: int = 1,  #使用第一个分区
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
         download: bool = False,
@@ -77,19 +80,33 @@ class DTD(VisionDataset):
 
         self._image_files = []
         classes = []
-        with open(
+        with open(  #读取分割文件
             self._meta_folder / f"{self._split}{self._partition}.txt"
         ) as file:
             for line in file:
-                cls, name = line.strip().split("/")
+                cls, name = line.strip().split("/")  #获取类别名和图片文件名  banded/banded_0001.jpg  类别名/文件名.jpg
                 self._image_files.append(
-                    self._images_folder.joinpath(cls, name)
+                    self._images_folder.joinpath(cls, name)  #拼接路径  dtd/images/banded/banded_0001.jpg
                 )
-                classes.append(cls)
-
-        self.classes = sorted(set(classes))
-        self.class_to_idx = dict(zip(self.classes, range(len(self.classes))))
+                classes.append(cls) #收集类别名
+        
+        #创建类别名列表和类别名到索引的映射
+        self.classes = sorted(set(classes)) #按字母排序
+        self.class_to_idx = dict(zip(self.classes, range(len(self.classes))))  # 创建字典，将类名映射到数字标签
         self._labels = [self.class_to_idx[cls] for cls in classes]
+        
+
+        
+        # # 输出类名到标签的映射，方便检查
+        # print(f"\n📊 DTD数据集 ({self._split}{self._partition}) 类别映射:")
+        # print(f"   总类别数: {len(self.classes)}")
+        # print(f"   样本数量: {len(self._image_files)}")
+        # print(f"   完整类别映射字典:")
+        # for class_name, class_idx in self.class_to_idx.items():
+        #     print(f"     '{class_name}' → {class_idx}")
+        # print(f"   ✅ 全部 {len(self.classes)} 个类别映射完成")
+
+
 
     def __len__(self) -> int:
         return len(self._image_files)

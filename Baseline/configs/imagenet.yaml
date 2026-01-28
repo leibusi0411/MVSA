@@ -1,0 +1,132 @@
+# ==============================================================================
+# CUB-200-2011 - 200 bird species
+# ==============================================================================
+
+# ----------------------------------------------------------------------------
+# 数据集配置 (Dataset Configuration)
+# ----------------------------------------------------------------------------
+dataset:
+  name: imagenet
+  data_root: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/imagenet/images
+  num_classes: 1000          # 类别数
+  num_workers: 8           # 数据加载进程数
+  preprocess: Base         # 预处理方案（Base=224, STN=448）；
+
+# ----------------------------------------------------------------------------
+# 实验1: Linear Probing (LP) - 线性探测
+# 说明: 冻结CLIP backbone，只训练线性分类头
+# ----------------------------------------------------------------------------
+lp:
+  # sklearn方法配置 (推荐, 快速且自动超参数搜索)
+  use_sklearn: false      # ImageNet数据量大，强烈建议使用PyTorch (false)，Sklearn可能会OOM或极慢
+  batch_size: 256           # LP (PyTorch) 训练批次大小；若切换 sklearn，可改为 256
+  
+  # sklearn超参数搜索配置（与transfer_learning一致）
+  num_cs: 10              # 减少搜索空间
+  start_c: -5              
+  end_c: 0                 
+  max_iter: 50            
+  random_state: 0          # 随机种子（与transfer_learning一致）
+  warm_start: true         # 热启动（加速超参数搜索）
+  
+  # PyTorch方法配置 (use_sklearn=false时使用)
+  epochs: 15               # LP收敛较快，ImageNet 10-20 epoch通常足够
+  lr: 1e-3                 # 学习率（回调至较保守的值）
+  weight_decay: 0.01       # 权重衰减（回到更强正则，经验更稳）
+  optimizer: adamw         # PyTorch优化器
+  # 优化器附加参数
+  beta1: 0.9               # AdamW beta1参数
+  beta2: 0.999             # AdamW beta2参数
+  eps: 1e-8                # AdamW epsilon参数
+  # 标准训练项（与代码联动）
+  scheduler: cosine_step   # 余弦退火（step-based）+ 线性 warmup
+  warmup_epochs: 5         # 预热 epoch 数（step-based）
+  min_factor: 0.05         # 退火下限比例（经验更稳的设置）
+  patience: 10             # 早停耐心（恢复较紧设置）
+  max_grad_norm: 1.0       # 梯度裁剪
+  head_lr_mult: 10.0        # 分类头学习率倍率
+  output_dir: ./outputs/LP/imagenet  # LP实验输出目录
+
+# ----------------------------------------------------------------------------
+# 实验2: Fine-Tuning (FT) - 全量微调
+# 说明: 解冻CLIP backbone，端到端训练整个模型
+# ----------------------------------------------------------------------------
+ft:
+  # 基础训练参数
+  epochs: 10               # 训练轮数（ImageNet 10 epoch 左右通常足够，或者更少）
+  patience: 3             # 早停耐心值 (10个epoch验证集不提升则停止)
+  batch_size: 64           # FT 批次大小 (建议64/32)
+  
+  # 优化器配置 (AdamW)
+  optimizer: adamw         # 优化器类型
+  lr: 0.000025            # 学习率（2e-5~3e-5），默认取 2.5e-5
+  weight_decay: 0.01       # 权重衰减 (0.01, L2正则化)
+  beta1: 0.9               # AdamW beta1参数
+  beta2: 0.95              # 参考 FT-CLIP，beta2 更小（0.95）
+  eps: 1e-08                # AdamW epsilon参数
+  
+  # 学习率调度器配置 (CosineAnnealingLR)
+  scheduler: cosine        # 余弦退火调度器
+  eta_min: 1e-06            # 最小学习率 (0.000001)
+  
+  # 学习率预热配置
+  warmup_epochs: 5         # 预热轮数
+  warmup_factor: 0.1       # 预热起始因子 (起始lr = lr * 0.1)
+  
+  # 梯度裁剪
+  max_grad_norm: 1.0       # 梯度裁剪阈值
+  output_dir: ./outputs/FT/imagenet
+  # 训练增强与优化设置（与 FT-CLIP 接轨的关键项，当前实现已支持 LLRD 与 EMA）
+  label_smoothing: 0.0     # 交叉熵标签平滑（FT-CLIP 默认0）
+  head_lr_mult: 5.0        # 分类头更大学习率倍率
+  # LLRD 衰减（靠近输入层更小 LR，靠近输出层更大 LR）
+  # 我们的实现默认 0.65，可按需调整（与 FT-CLIP --layer_decay 类似）
+  # llrd_decay: 0.65
+  # EMA（在 train_ft.py 中默认启用，可改为 0.999~0.9998）
+  # ema_enabled: true
+  # ema_decay: 0.999
+
+# ----------------------------------------------------------------------------
+# 实验3: LP-FT - 两阶段训练 (Linear Probing → Fine-Tuning)
+# 说明: 先用LP快速初始化分类头，再用FT微调整个模型
+# ----------------------------------------------------------------------------
+lp_ft:
+  # --- 阶段1: Linear Probing ---
+  lp_epochs: 80            # LP训练轮数（更充分，但配合早停）
+  lp_lr: 0.001             # LP学习率
+  lp_weight_decay: 0.01    # LP权重衰减（适度正则，提升泛化）
+  lp_optimizer: adamw      # LP优化器
+  
+  # --- 阶段2: Fine-Tuning ---
+  ft_epochs: 100           # FT训练轮数
+  ft_patience: 10          # FT早停耐心值
+  ft_lr: 5e-06             # FT学习率（更小，更稳，更常见于CLIP精调）
+  ft_weight_decay: 0.01    # FT权重衰减
+  ft_optimizer: adamw      # FT优化器
+  ft_beta1: 0.9            # FT AdamW beta1
+  ft_beta2: 0.999          # FT AdamW beta2
+  ft_eps: 1e-08             # FT AdamW epsilon
+  ft_scheduler: cosine     # FT调度器
+  ft_eta_min: 1e-06         # FT最小学习率
+  ft_warmup_epochs: 1      # FT预热轮数
+  ft_warmup_factor: 0.1    # FT预热因子
+  ft_max_grad_norm: 1.0    # FT梯度裁剪
+  output_dir: ./outputs/LP_FT/imagenet  # LP-FT实验输出目录
+  lp_batch_size: 256       # LP 阶段批次大小
+  ft_batch_size: 64        # FT 阶段批次大小
+  # LP 标准训练项（与代码联动）
+  lp_scheduler: cosine_step   # 余弦退火（step-based）+ 线性 warmup
+  lp_warmup_epochs: 5         # 预热 epoch 数（step-based）
+  lp_min_factor: 0.05         # 退火下限比例（相对 base lr）
+  lp_patience: 10             # 早停耐心（0 关闭）
+  lp_max_grad_norm: 1.0       # 梯度裁剪
+  lp_head_lr_mult: 5.0        # 分类头学习率倍率
+  lp_beta1: 0.9               # AdamW beta1（LP）
+  lp_beta2: 0.999             # AdamW beta2（LP）
+  lp_eps: 1e-8                # AdamW eps（LP）
+
+# ----------------------------------------------------------------------------
+# 模型配置 (Model Configuration)
+# ----------------------------------------------------------------------------
+model:
+  name: ViT-B/32          # CLIP模型架构 (可选: ViT-B/32, ViT-B/16, ViT-L/14)

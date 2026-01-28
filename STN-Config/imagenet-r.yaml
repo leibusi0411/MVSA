@@ -1,0 +1,67 @@
+# ImageNet-R (Rendition) 测试配置文件
+# 用于领域泛化实验 - 测试对艺术风格变化的鲁棒性
+
+# === 基础模型配置 ===
+model_size: ViT-B/16       # CLIP模型大小
+dataset: imagenet-r        # 数据集名称
+data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/DATA/imagenet-r    # 修改为你的ImageNet-R数据集路径
+
+# === STN核心配置 ===
+stn_config:
+  # 网络架构参数（与ImageNet训练配置保持一致）
+  hidden_dim: 256          # 注意力和MLP的隐藏维度
+  num_heads: 8             # 多头注意力的头数
+  dropout: 0.1             # Dropout概率
+  patch_layer: -2          # 提取patch特征的ViT层
+  num_views: 4             # 多视角STN的视角数量
+  fusion_mode: transformer # 特征融合模式
+  
+  # Transformer融合配置
+  transformer_heads: 8      # Transformer注意力头数
+  transformer_layers: 2     # Transformer编码器层数
+  transformer_dropout: 0.1  # Transformer的Dropout概率
+
+  # 多视角STN损失配置（测试时不使用，但需要保持一致以加载模型）
+  classification_weight: 1.0
+  contrastive_weight: 0.0
+  decorrelation_weight: 0.5
+  adaptive_weight: 0.7
+  logits_temp: 0.07
+
+# === 训练配置（测试时不使用，但保留以保持配置完整性）===
+training:
+  epochs: 100
+  batch_size: 48
+  num_workers: 10
+  
+  optimizer: adamw
+  learning_rate: 3e-4
+  weight_decay: 1e-2
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  mixed_precision: false
+  
+  patience: 10
+  eta_min: 1e-6
+  warmup_epochs: 8
+  warmup_factor: 0.05
+  max_grad_norm: 1.0
+  grad_norm_type: 2.0
+
+# 数据集结构说明：
+# /path/to/imagenet-r/
+#   └── test/
+#       ├── n01440764/  (类别文件夹)
+#       │   ├── art_image1.jpg
+#       │   └── cartoon_image2.jpg
+#       ├── n01443537/
+#       └── ...
+
+# 数据集特点：
+# - 包含艺术作品、卡通、涂鸦等风格化图像
+# - 200个ImageNet类别的子集
+# - 约30,000张图像
+
+# 测试命令：
+# python test_multi_stn.py --dataset_name imagenet-r --batch_size 32

@@ -1,0 +1,124 @@
+# ==============================================================================
+# DTD (Describable Textures Dataset) - 47 texture categories
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 数据集配置 (Dataset Configuration)
+# ------------------------------------------------------------------------------
+dataset:
+  name: dtd
+  data_root: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/WCA/data
+  num_classes: 47          # 类别数
+  num_workers: 8           # 数据加载进程数
+  preprocess: Base         # 预处理方案（Base=224, STN=448）；统一与 cub.yaml
+
+# ------------------------------------------------------------------------------
+# 实验1: Linear Probing (LP) - 线性探测
+# 说明: 冻结CLIP backbone，只训练线性分类头
+# ------------------------------------------------------------------------------
+lp:
+  # sklearn方法配置 (推荐, 快速且自动超参数搜索)
+  use_sklearn: false        # 统一使用 PyTorch 训练线性头
+  batch_size: 64           # LP (PyTorch) 训练批次大小；若切换 sklearn，可改为 256
+  
+  # sklearn超参数搜索配置（与transfer_learning一致）
+  num_cs: 100              # C值数量 (搜索100个不同的C值)
+  start_c: -7              # C值起始指数 (10^-7)
+  end_c: 2                 # C值结束指数 (10^2)
+  max_iter: 200            # sklearn最大迭代次数（与transfer_learning一致）
+  random_state: 0          # 随机种子（与transfer_learning一致）
+  warm_start: true         # 热启动（加速超参数搜索）
+  
+  # PyTorch方法配置 (use_sklearn=false时使用)
+  epochs: 100              # PyTorch训练轮数
+  lr: 1e-3                 # PyTorch学习率 (0.001)
+  weight_decay: 0.01       # 适度正则，有助于泛化
+  optimizer: adamw         # PyTorch优化器
+  
+  # AdamW参数 (PyTorch方法)
+  beta1: 0.9               # AdamW beta1参数
+  beta2: 0.999             # AdamW beta2参数
+  eps: 1e-8                # AdamW epsilon参数
+  # 标准训练项（与代码联动）
+  scheduler: cosine_step   # 余弦退火（step-based）+ 线性 warmup
+  warmup_epochs: 5         # 预热 epoch 数（step-based）
+  min_factor: 0.05         # 退火下限比例（相对 base lr）
+  patience: 10             # 早停耐心（0 关闭）
+  max_grad_norm: 1.0       # 梯度裁剪
+  head_lr_mult: 5.0        # 分类头学习率倍率
+  output_dir: ./outputs/LP/dtd  # LP实验输出目录
+
+# ------------------------------------------------------------------------------
+# 实验2: Fine-Tuning (FT) - 全量微调
+# 说明: 解冻CLIP backbone，端到端训练整个模型
+# ------------------------------------------------------------------------------
+ft:
+  # 基础训练参数
+  epochs: 100              # 训练轮数
+  patience: 10             # 早停耐心值 (10个epoch验证集不提升则停止)
+  batch_size: 64           # FT 批次大小
+  
+  # 优化器配置 (AdamW)
+  optimizer: adamw         # 优化器类型
+  lr: 1e-4                 # 学习率 (0.0001, 与STN主实验一致)
+  weight_decay: 1e-2       # 权重衰减 (0.01, L2正则化)
+  beta1: 0.9               # AdamW beta1参数
+  beta2: 0.999             # AdamW beta2参数
+  eps: 1e-8                # AdamW epsilon参数
+  
+  # 学习率调度器配置 (CosineAnnealingLR)
+  scheduler: cosine        # 余弦退火调度器
+  eta_min: 1e-6            # 最小学习率 (0.000001)
+  
+  # 学习率预热配置
+  warmup_epochs: 5         # 预热轮数
+  warmup_factor: 0.1       # 预热起始因子 (起始lr = lr * 0.1)
+  
+  # 梯度裁剪
+  max_grad_norm: 1.0       # 梯度裁剪阈值
+  output_dir: ./outputs/FT/dtd
+
+# ------------------------------------------------------------------------------
+# 实验3: LP-FT - 两阶段训练 (Linear Probing → Fine-Tuning)
+# 说明: 先用LP快速初始化分类头，再用FT微调整个模型
+# ------------------------------------------------------------------------------
+lp_ft:
+  # --- 阶段1: Linear Probing ---
+  lp_epochs: 50            # LP训练轮数
+  lp_lr: 1e-3              # LP学习率
+  lp_weight_decay: 0       # LP权重衰减
+  lp_optimizer: adamw      # LP优化器
+  # LP 标准训练项（与代码联动）
+  lp_scheduler: cosine_step   # 余弦退火（step-based）+ 线性 warmup
+  lp_warmup_epochs: 5         # 预热 epoch 数（step-based）
+  lp_min_factor: 0.05         # 退火下限比例（相对 base lr）
+  lp_patience: 10             # 早停耐心（0 关闭）
+  lp_max_grad_norm: 1.0       # 梯度裁剪
+  lp_head_lr_mult: 5.0        # 分类头学习率倍率
+  lp_beta1: 0.9               # AdamW beta1（LP）
+  lp_beta2: 0.999             # AdamW beta2（LP）
+  lp_eps: 1e-8                # AdamW eps（LP）
+  
+  # --- 阶段2: Fine-Tuning ---
+  ft_epochs: 100           # FT训练轮数
+  ft_patience: 10          # FT早停耐心值
+  ft_lr: 1e-4              # FT学习率
+  ft_weight_decay: 1e-2    # FT权重衰减
+  ft_optimizer: adamw      # FT优化器
+  ft_beta1: 0.9            # FT AdamW beta1
+  ft_beta2: 0.999          # FT AdamW beta2
+  ft_eps: 1e-8             # FT AdamW epsilon
+  ft_scheduler: cosine     # FT调度器
+  ft_eta_min: 1e-6         # FT最小学习率
+  ft_warmup_epochs: 5      # FT预热轮数
+  ft_warmup_factor: 0.1    # FT预热因子
+  ft_max_grad_norm: 1.0    # FT梯度裁剪
+  output_dir: ./outputs/LP_FT/dtd  # LP-FT实验输出目录
+  lp_batch_size: 128       # LP 阶段批次大小
+  ft_batch_size: 64        # FT 阶段批次大小
+
+# ------------------------------------------------------------------------------
+# 模型配置 (Model Configuration)
+# ------------------------------------------------------------------------------
+model:
+  name: ViT-B/16         # CLIP模型架构 (可选: ViT-B/32, ViT-B/16, ViT-L/14)
