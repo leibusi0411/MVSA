@@ -87,7 +87,8 @@ from .loss_multi import (
     ClassificationLoss,
     FeatureDecorrelationLoss, 
     AdaptiveClassificationLoss,
-    ContrastiveLoss
+    KLConsistencyLoss,
+    FairnessRegularizationLoss
 )
 
 # __all__ 列表明确指定了当其他Python文件使用 from stn import * 语法时会导入哪些类或函数

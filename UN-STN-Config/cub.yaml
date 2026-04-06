@@ -1,0 +1,113 @@
+# 无监督STN配置 - CUB-200-2011 鸟类数据集
+# 用于无监督训练实验（不使用标签信息）
+
+# === 基础模型配置 ===
+model_size: ViT-B/16
+dataset: cub
+data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/WCA/data/CUB_200_2011
+
+# === STN核心配置 ===
+stn_config:
+  # 网络架构参数
+  hidden_dim: 256
+  dropout: 0.1
+  num_views: 4              # 多视角数量
+  fusion_mode: weighted     # 特征融合模式
+  
+  # Transformer融合配置（当fusion_mode=transformer时生效）
+  transformer_heads: 8
+  transformer_layers: 2
+  transformer_dropout: 0.1
+
+  # === 温度参数配置 ===
+  logits_temp: 0.07         # 基础温度参数（用于分类损失等其他损失）
+  
+  # 注意：KL散度一致性损失的温度参数已硬编码在损失函数中
+  # - 局部视角温度: 0.1 (约1.4倍基础温度，soft分布，鼓励探索)
+  # - 融合特征温度: 0.05 (0.7倍基础温度，hard分布，明确监督)
+  
+  # === 无监督损失权重配置 ===
+  # 有监督损失（禁用）
+  classification_weight: 0.0     # 禁用分类损失（无监督）
+  
+  # 无监督损失组合
+  kl_consistency_weight: 0.7     # KL主损失权重（阶段二周期目标KL也使用该权重）
+  fairness_weight: 0.1           # 公平性正则化损失（防止模型坍缩）
+  decorrelation_weight: 0.1      # 特征去相关损失（鼓励视角多样性）
+  adaptive_weight: 0.0           # 自适应分类损失（可选，默认禁用）
+
+  # === 两阶段无监督训练配置（新增） ===
+  # 阶段一（warmup）: Global -> Local + Global -> Fused
+  # 阶段二（periodic）: 每隔若干epoch刷新一次融合teacher分布，期间固定目标监督局部视角
+  two_stage:
+    warmup_epochs: 8             # 阶段一持续的epoch数（细粒度任务可适当更长）
+    target_update_interval_epochs: 3  # 目标分布刷新周期，单位=epoch
+
+    # 阶段一参数（Global teacher指导Local与Fused）
+    teacher_temp: 0.07           # 全局teacher分布温度（越小越尖锐）
+    warmup_student_temp: 0.07    # warmup阶段student温度（作用于local/fused分布）
+    warmup_local_weight: 1.0     # KL(Global->Local)权重
+    warmup_fused_weight: 1.0     # KL(Global->Fused)权重
+
+    # 阶段二参数（周期目标分布）
+    dec_target_temp: 0.07        # 目标分布温度（teacher端，越小越尖锐）
+    dec_student_temp: 0.15       # student端温度（越大越平滑）
+    # 阶段二KL损失权重统一使用 stn_config.kl_consistency_weight
+
+# === 训练配置 ===
+training:
+  # 基础训练参数
+  epochs: 100
+  batch_size: 32
+  num_workers: 8
+  
+  # 优化器配置
+  optimizer: adamw
+  learning_rate: 5e-5
+  weight_decay: 1e-2
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  mixed_precision: false
+  
+  # 早停配置
+  patience: 10              # 无监督训练可能需要更多耐心
+  
+  # 学习率调度
+  eta_min: 1e-6
+  
+  # 学习率预热
+  warmup_epochs: 5               # 仅用于学习率warmup，不控制two_stage阶段切换
+  warmup_factor: 0.1
+  
+  # 梯度裁剪
+  max_grad_norm: 1.0
+  grad_norm_type: 2.0
+
+# === 说明 ===
+# 无监督训练策略：
+# 1. 不使用标签信息（classification_weight=0）
+# 2. KL一致性损失作为主要监督信号
+#    - 让局部视角的预测分布接近融合特征的预测分布
+#    - 融合特征作为"教师"，局部视角作为"学生"
+# 3. 公平性正则化防止模型坍缩到单一类别
+#    - 鼓励模型对所有类别进行均匀预测
+#    - 避免无监督训练中常见的模式坍缩问题
+# 4. 特征去相关鼓励不同视角学习互补特征
+#    - 最小化不同视角特征之间的相关性
+#    - 确保每个视角关注图像的不同区域/特征
+# 5. 准确率仅用于监控，不参与训练
+#
+# 温度蒸馏策略（硬编码在损失函数中）：
+# - 局部视角温度: 0.1 (约1.4倍CLIP标准温度)
+#   → 预测分布更平滑（soft targets）
+#   → 鼓励探索多种可能性，避免过早收敛
+#   → 保留更多类别间的相对关系信息
+# - 融合特征温度: 0.05 (0.7倍CLIP标准温度)
+#   → 预测分布更尖锐（hard targets）
+#   → 提供明确的监督信号
+#   → 强调最可能的类别
+# - 这种不对称温度设计有助于知识蒸馏：
+#   → 教师（融合特征）给出明确指导
+#   → 学生（局部视角）有更大的学习空间
+#   → 平衡了监督信号的明确性和学习的灵活性

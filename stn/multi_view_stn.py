@@ -130,7 +130,7 @@ class MultiViewSTNModel(nn.Module):
         print(f"    🔒 CLIP模型参数已冻结: {frozen_params:,} 个参数")
         print(f"    🎯 可训练STN参数: {trainable_params:,} 个参数")
     
-    def forward(self, images_448, mode='train'):
+    def forward(self, images_448, mode='train', return_original_features=False):
         """
         多视角STN前向传播 
         
@@ -141,10 +141,14 @@ class MultiViewSTNModel(nn.Module):
                            用于训练和验证阶段，需要 view_features 计算损失
                 - 'test': 测试模式，返回 (fused_features, vis_data)
                           用于测试阶段，需要可视化数据
+            return_original_features (bool): 仅在 mode='train' 时生效。
+                为 True 时额外返回原图CLS全局特征（已L2归一化），用于上层复用避免重复编码。
             
         Returns:
             根据 mode 返回不同内容：
             - mode='train': (fused_features [B, D], view_features [B, N, D])
+              当 return_original_features=True 时返回
+              (fused_features [B, D], view_features [B, N, D], original_features [B, D])
             - mode='test': (fused_features [B, D], vis_data dict)
         """
         batch_size = images_448.size(0)
@@ -192,6 +196,8 @@ class MultiViewSTNModel(nn.Module):
         # === 步骤6：根据模式返回不同结果 ===
         if mode == 'train':
             # 训练/验证模式：返回融合特征和多视角特征（用于损失计算）
+            if return_original_features:
+                return fused_features, multi_view_features, original_features
             return fused_features, multi_view_features
         elif mode == 'test':
             # 测试模式：返回融合特征和可视化数据

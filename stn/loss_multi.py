@@ -35,6 +35,8 @@ class MultiViewSTNLoss(nn.Module):
     1. 分类损失（交叉熵）- 基础分类损失
     2. 特征去相关损失 - 鼓励不同视角学习互补特征
     3. 自适应分类损失 - 动态平衡不同视角的训练
+    4. KL散度一致性损失 - 局部视角与融合特征的预测分布一致性
+    5. 公平性正则化损失 - 鼓励跨类别的均匀预测，防止模型坍缩
     
     设计原则：
     - 模块化设计，每个损失可独立启用/禁用
@@ -45,24 +47,33 @@ class MultiViewSTNLoss(nn.Module):
     def __init__(self, 
                  logits_temp=0.07,              # 温度参数（用于相似度计算）
                  classification_weight=1.0,     # 标准分类损失权重（0=禁用）
-                 contrastive_weight=0.0,        # 对比损失权重（0=禁用）
                  decorrelation_weight=0.0,      # 特征去相关损失权重（0=禁用）
-                 adaptive_weight=0.0):          # 自适应分类损失权重（0=禁用）
+                 adaptive_weight=0.0,           # 自适应分类损失权重（0=禁用）
+                 kl_consistency_weight=0.0,     # KL散度一致性损失权重（0=禁用）
+                 fairness_weight=0.0,           # 公平性正则化损失权重（0=禁用）
+                 stn_config=None):              # STN配置字典（用于读取温度参数）
         """
         Args:
             logits_temp (float): 温度参数（用于相似度计算）
             classification_weight (float): 标准分类损失权重，0表示禁用
-            contrastive_weight (float): 对比损失权重，0表示禁用
             decorrelation_weight (float): 特征去相关损失权重，0表示禁用
             adaptive_weight (float): 自适应分类损失权重，0表示禁用
+            kl_consistency_weight (float): KL散度一致性损失权重，0表示禁用
+            fairness_weight (float): 公平性正则化损失权重，0表示禁用
+            stn_config (dict): STN配置字典，用于读取KL损失的温度参数
         """
         super().__init__()
         
         self.classification_weight = classification_weight
-        self.contrastive_weight = contrastive_weight
         self.decorrelation_weight = decorrelation_weight
         self.adaptive_weight = adaptive_weight
+        self.kl_consistency_weight = kl_consistency_weight
+        self.fairness_weight = fairness_weight
         self.temperature = logits_temp
+        
+        # 保存配置用于KL损失初始化
+        if stn_config is None:
+            stn_config = {}
         
         # 初始化损失函数组件
         # 标准分类损失
@@ -72,14 +83,6 @@ class MultiViewSTNLoss(nn.Module):
         else:
             self.classification_loss = None
             print("⚠️  标准分类损失已禁用")
-        
-        # 对比损失
-        if contrastive_weight > 0:
-            self.contrastive_loss = ContrastiveLoss(temperature=logits_temp, use_cosine_sim=True)
-            print(f"🌟 启用对比损失 (权重={contrastive_weight}, 温度={logits_temp})")
-        else:
-            self.contrastive_loss = None
-            print("⚠️  对比损失已禁用")
         
         # 特征去相关损失（可选）
         if decorrelation_weight > 0:
@@ -96,6 +99,23 @@ class MultiViewSTNLoss(nn.Module):
         else:
             self.adaptive_loss = None
             print("⚠️  自适应分类损失已禁用")
+        
+        # KL散度一致性损失（可选）
+        if kl_consistency_weight > 0:
+            # 硬编码温度参数：局部视角温度高，融合特征温度低
+            self.kl_consistency_loss = KLConsistencyLoss()
+            print(f"🔄 启用KL散度一致性损失 (权重={kl_consistency_weight})")
+        else:
+            self.kl_consistency_loss = None
+            print("⚠️  KL散度一致性损失已禁用")
+        
+        # 公平性正则化损失（可选）
+        if fairness_weight > 0:
+            self.fairness_loss = FairnessRegularizationLoss()
+            print(f"⚖️  启用公平性正则化损失 (权重={fairness_weight})")
+        else:
+            self.fairness_loss = None
+            print("⚠️  公平性正则化损失已禁用")
     
     def forward(self, labels, similarity_or_logits, view_features=None, text_features=None):
         """
@@ -103,15 +123,15 @@ class MultiViewSTNLoss(nn.Module):
         
         Args:
             labels (torch.Tensor): 真实标签 [B]
-            similarity_or_logits (torch.Tensor): 相似度矩阵或logits [B, num_classes]
-            view_features (torch.Tensor, optional): 多视角特征 [B, N, D] (去相关和自适应损失需要)
-            text_features (torch.Tensor, optional): 文本特征 [D, num_classes] (自适应损失需要)
+            similarity_or_logits (torch.Tensor): 融合特征的相似度矩阵或logits [B, num_classes]
+            view_features (torch.Tensor, optional): 多视角特征 [B, N, D] (去相关、自适应和KL一致性损失需要)
+            text_features (torch.Tensor, optional): 文本特征 [D, num_classes] (自适应、KL一致性和公平性损失需要)
                 
         Returns:
             tuple: (总损失, 损失详情字典)
         """
 
-        #分别计算分类损失、特征去相关损失、自适应分类损失
+        #分别计算分类损失、特征去相关损失、自适应分类损失、KL散度一致性损失、公平性正则化损失
         loss_details = {}
 
         # 初始化总损失和损失详情
@@ -128,22 +148,6 @@ class MultiViewSTNLoss(nn.Module):
         else:
             loss_details['classification'] = 0.0
             loss_details['classification_weighted'] = 0.0
-        
-        # 计算对比损失（如果启用）
-        contrastive_loss_value = torch.tensor(0.0, device=total_loss.device)
-        if self.contrastive_loss is not None and self.contrastive_weight > 0:
-            # 使用预计算的相似度矩阵
-            contrastive_loss_value = self.contrastive_loss(
-                labels=labels,
-                similarity_matrix=similarity_or_logits
-            )
-            weighted_contrastive_loss = contrastive_loss_value * self.contrastive_weight
-            total_loss += weighted_contrastive_loss
-            loss_details['contrastive'] = contrastive_loss_value.item()
-            loss_details['contrastive_weighted'] = weighted_contrastive_loss.item()
-        else:
-            loss_details['contrastive'] = 0.0
-            loss_details['contrastive_weighted'] = 0.0
         
         # 计算特征去相关损失（如果启用）
         decorrelation_loss_value = torch.tensor(0.0, device=total_loss.device)
@@ -172,6 +176,43 @@ class MultiViewSTNLoss(nn.Module):
         else:
             loss_details['adaptive'] = 0.0
             loss_details['adaptive_weighted'] = 0.0
+        
+        # 计算KL散度一致性损失（如果启用）
+        kl_consistency_loss_value = torch.tensor(0.0, device=total_loss.device)
+        if self.kl_consistency_loss is not None and self.kl_consistency_weight > 0:
+            if view_features is None or text_features is None:
+                raise ValueError("KL散度一致性损失需要view_features和text_features参数")
+            # 注意：这里传入的similarity_or_logits应该是未经温度缩放的原始相似度
+            # 如果已经缩放过，需要在训练脚本中传入原始相似度
+            kl_consistency_loss_value = self.kl_consistency_loss(
+                view_features=view_features,
+                text_features=text_features,
+                fused_logits=similarity_or_logits  # 应该是未缩放的原始相似度
+            )
+            weighted_kl_consistency_loss = kl_consistency_loss_value * self.kl_consistency_weight
+            total_loss += weighted_kl_consistency_loss
+            loss_details['kl_consistency'] = kl_consistency_loss_value.item()
+            loss_details['kl_consistency_weighted'] = weighted_kl_consistency_loss.item()
+        else:
+            loss_details['kl_consistency'] = 0.0
+            loss_details['kl_consistency_weighted'] = 0.0
+        
+        # 计算公平性正则化损失（如果启用）
+        fairness_loss_value = torch.tensor(0.0, device=total_loss.device)
+        if self.fairness_loss is not None and self.fairness_weight > 0:
+            if view_features is None or text_features is None:
+                raise ValueError("公平性正则化损失需要view_features和text_features参数")
+            fairness_loss_value = self.fairness_loss(
+                view_features=view_features,
+                text_features=text_features
+            )
+            weighted_fairness_loss = fairness_loss_value * self.fairness_weight
+            total_loss += weighted_fairness_loss
+            loss_details['fairness'] = fairness_loss_value.item()
+            loss_details['fairness_weighted'] = weighted_fairness_loss.item()
+        else:
+            loss_details['fairness'] = 0.0
+            loss_details['fairness_weighted'] = 0.0
         
         loss_details['total'] = total_loss.item()
         
@@ -372,79 +413,169 @@ class AdaptiveClassificationLoss(nn.Module):
 
 
 
-class ContrastiveLoss(nn.Module):
+class FairnessRegularizationLoss(nn.Module):
     """
-    批内对比损失：图-文批内对比学习损失
+    公平性正则化损失：鼓励跨类别的均匀预测，防止模型坍缩
     
     核心思想：
-    1. 根据labels从logits中提取对应类别的相似度，构建B×B的相似度矩阵
-    2. 对角线元素为正样本对（图片i与其对应文本i）
-    3. 非对角线元素为负样本对（图片i与其他文本j）
-    4. 使用交叉熵损失优化，期望正样本相似度最大
+    1. 计算当前batch中所有样本对每个类别的平均预测概率 p̄_c
+    2. 最大化平均预测分布的熵：L_reg = -Σ log(p̄_c)
+    3. 强迫模型"雨露均沾"，不要只盯着某一个类别输出
+    4. 防止无监督训练中的模型坍缩问题
+    
+    数学公式：
+        L_reg = -Σ_{c=1}^{C} log(p̄_c)
+        其中 p̄_c = (1/B) Σ_{i=1}^{B} p_i(c)
+    
+    优势：
+    - 防止坍缩：避免模型将所有样本预测为同一类别
+    - 无监督友好：不需要标签信息
+    - 数值稳定：使用log-sum-exp技巧
     """
     
-    def __init__(self, temperature=0.07, use_cosine_sim=True):
-        """
-        Args:
-            temperature (float): 温度参数，控制相似度分布的尖锐程度
-            use_cosine_sim (bool): 是否使用余弦相似度（推荐）
-        """
+    def __init__(self):
         super().__init__()
-        self.temperature = temperature
-        self.use_cosine_sim = use_cosine_sim
-        
-    def forward(self, labels, similarity_matrix):
+    
+    def forward(self, view_features, text_features):
         """
-        计算批内对比损失
+        计算公平性正则化损失
         
         Args:
-            labels (torch.Tensor): 真实标签 [B]
-            similarity_matrix (torch.Tensor): 经过温度缩放的logits矩阵 [B, num_classes]
+            view_features (torch.Tensor): 多视角特征 [B, N, D]
+            text_features (torch.Tensor): 文本特征 [D, num_classes]
             
         Returns:
-            torch.Tensor: 对比损失标量
+            torch.Tensor: 公平性正则化损失标量
         """
-        batch_size = labels.size(0)
-        device = labels.device
+        batch_size, num_views, feature_dim = view_features.shape
+        num_classes = text_features.shape[1]
         
-        # === 步骤1: 使用预计算的温度缩放logits矩阵 ===
-        logits_matrix = similarity_matrix.float()  # [B, num_classes] 已经过温度缩放
+        # === 步骤1: 确保特征已经L2归一化 ===
+        view_features_norm = F.normalize(view_features, p=2, dim=-1)  # [B, N, D]
+        text_features_norm = F.normalize(text_features, p=2, dim=0)  # [D, num_classes]
         
-        # === 步骤2: 根据labels提取对应列，构建B×B相似度矩阵 ===
-        # 提取每个样本对应类别的列
-        batch_text_logits = logits_matrix[:, labels]  # [B, B]
-        # batch_text_logits[i, j] = 图片i与样本j对应类别文本的相似度（已温度缩放）
+        # === 步骤2: 计算所有视角的logits ===
+        # 重塑view_features: [B*N, D]
+        view_features_reshaped = view_features_norm.reshape(-1, feature_dim)  # [B*N, D]
         
-        # === 步骤3: 构建有监督的正样本掩码 ===
-        # positive_mask[i, j] is True if image_i and text_j have the same class
-        positive_mask = (labels.unsqueeze(1) == labels.unsqueeze(0)).float()  # [B, B]
+        # 计算相似度: [B*N, num_classes]
+        similarity_all = torch.matmul(view_features_reshaped, text_features_norm)  # [B*N, num_classes]
         
-        # === 步骤4: 计算有监督对比损失 (InfoNCE形式) ===
-        # 为了数值稳定性，从logits中减去最大值（logits已经过温度缩放）
-        logits_max, _ = torch.max(batch_text_logits, dim=1, keepdim=True)
-        stable_logits = batch_text_logits - logits_max.detach()  # [B, B]
-
-        # 计算 exp(logits)
-        exp_logits = torch.exp(stable_logits)  # [B, B]对矩阵中的每个元素都计算指数值
+        # === 步骤3: 计算预测概率分布 ===
+        # 使用softmax得到概率分布（不需要温度缩放，因为我们关注的是分布形状）
+        probs_all = F.softmax(similarity_all, dim=-1)  # [B*N, num_classes]
         
-        # 分子: sum of exp(logits) for all positive pairs (包括对角线)
-        # (bs, bs) * (bs, bs) -> 逐元素相乘，只保留正样本的exp_logits
-        # .sum(1) -> 按行求和
-        sum_exp_positives = (exp_logits * positive_mask).sum(dim=1) #两个矩阵逐元素相乘，然后按行求和  分子，维度为[B]
-
-        # 分母: sum of exp(logits) for all pairs (包括正样本和负样本)
-        sum_exp_all = exp_logits.sum(dim=1)  #logits矩阵按行求和，分母，维度为[B]
+        # === 步骤4: 计算batch内的平均预测概率 ===
+        # 对所有样本和视角求平均，得到每个类别的平均预测概率
+        mean_probs = probs_all.mean(dim=0)  # [num_classes]
         
-        # 计算每个样本的损失
-        # -log(分子 / 分母)
-        # 加上epsilon防止log(0)
+        # === 步骤5: 计算负对数似然（最大化熵）===
+        # L_reg = -Σ log(p̄_c)
+        # 添加epsilon防止log(0)
         epsilon = 1e-8
-        log_probs = torch.log(sum_exp_positives / (sum_exp_all + epsilon) + epsilon)  #维度为[B]，计算每个样本的损失
+        fairness_loss = -torch.log(mean_probs + epsilon).sum()
         
-        # 我们希望最大化log_probs，所以损失是它的负数
-        # 现在所有样本都有正样本（至少包括自身），所以不需要过滤
-        loss = -log_probs.mean()
+        return fairness_loss
+
+
+class KLConsistencyLoss(nn.Module):
+    """
+    KL散度一致性损失：局部视角预测分布与融合特征预测分布的一致性
+    
+    核心思想：
+    1. 计算每个局部视角的预测分布 P_view(y|x)
+    2. 使用融合特征的预测分布 P_fused(y|x) 作为目标分布
+    3. 最小化 KL(P_fused || P_view)，使局部视角的预测接近融合预测
+    4. 适用于无监督场景，不需要真实标签
+    
+    温度蒸馏策略（硬编码）：
+    - 局部视角温度高（0.14）→ 预测分布平滑（soft），鼓励探索
+    - 融合特征温度低（0.05）→ 预测分布尖锐（hard），提供明确监督
+    
+    优势：
+    - 无监督：不依赖标签信息
+    - 一致性：鼓励局部视角与全局融合保持一致
+    - 互补性：配合去相关损失，实现"一致但互补"的视角学习
+    - 温度蒸馏：通过不同温度控制学习难度
+    """
+    
+    def __init__(self):
+        """
+        温度参数硬编码：
+        - view_temperature = 0.1 (局部视角，soft分布)
+        - fused_temperature = 0.05 (融合特征，hard分布)
+        """
+        super().__init__()
+        # 硬编码温度参数
+        self.view_temperature = 0.1    # 局部视角温度（约1.4倍CLIP标准温度0.07）
+        self.fused_temperature = 0.05  # 融合特征温度（0.7倍CLIP标准温度）
+        
+        print(f"    🌡️  KL一致性损失温度配置（硬编码）:")
+        print(f"       - 局部视角温度: {self.view_temperature} (soft, 鼓励探索)")
+        print(f"       - 融合特征温度: {self.fused_temperature} (hard, 明确监督)")
+        
+    def forward(self, view_features, text_features, fused_logits):
+        """
+        计算KL散度一致性损失（支持不同温度参数）
+        
+        Args:
+            view_features (torch.Tensor): 多视角特征 [B, N, D]
+            text_features (torch.Tensor): 文本特征 [D, num_classes]
+            fused_logits (torch.Tensor): 融合特征的logits [B, num_classes] (未经温度缩放的原始相似度)
             
-        return loss
+        Returns:
+            torch.Tensor: KL散度一致性损失标量
+        """
+        batch_size, num_views, feature_dim = view_features.shape
+        num_classes = text_features.shape[1]
         
+        # === 步骤1: 确保特征已经L2归一化 ===
+        view_features_norm = F.normalize(view_features, p=2, dim=-1)  # [B, N, D]
+        text_features_norm = F.normalize(text_features, p=2, dim=0)  # [D, num_classes]
+        
+        # === 步骤2: 计算融合特征的目标分布（使用融合温度）===
+        # 注意：fused_logits是未经温度缩放的原始相似度
+        # 使用较低的温度使分布更尖锐（hard target）
+        fused_logits_scaled = fused_logits / self.fused_temperature  # [B, num_classes]
+        target_distribution = F.softmax(fused_logits_scaled.detach(), dim=-1)  # [B, num_classes]
+        
+        # === 步骤3: 向量化计算所有局部视角的logits ===
+        # 重塑view_features以便进行批量矩阵乘法: [B*N, D]
+        view_features_reshaped = view_features_norm.reshape(-1, feature_dim)  # [B*N, D]
+        
+        # 一次性计算所有视角与文本特征的相似度: [B*N, num_classes]
+        similarity_all = torch.matmul(view_features_reshaped, text_features_norm)  # [B*N, num_classes]
+        
+        # 应用局部视角温度缩放（使用较高的温度使分布更平滑）
+        view_logits_all = similarity_all / self.view_temperature  # [B*N, num_classes]
+        
+        # 重塑回原始维度: [B, N, num_classes]
+        view_logits_matrix = view_logits_all.reshape(batch_size, num_views, num_classes)  # [B, N, num_classes]
+        
+        # === 步骤4: 计算每个视角的预测分布 ===
+        view_distributions = F.softmax(view_logits_matrix, dim=-1)  # [B, N, num_classes]
+        
+        # === 步骤5: 计算KL散度 ===
+        # KL(P_target || P_view) = sum(P_target * log(P_target / P_view))
+        # 使用PyTorch的kl_div函数：kl_div(log(P_view), P_target)
+        # 注意：kl_div期望第一个参数是log概率，第二个参数是目标概率
+        
+        # 扩展目标分布以匹配所有视角: [B, num_classes] -> [B, N, num_classes]
+        target_distribution_expanded = target_distribution.unsqueeze(1).expand(-1, num_views, -1)  # [B, N, num_classes]
+        
+        # 计算log概率（添加epsilon防止log(0)）
+        epsilon = 1e-8
+        log_view_distributions = torch.log(view_distributions + epsilon)  # [B, N, num_classes]
+        
+        # 计算KL散度（reduction='batchmean'会对所有元素求平均）
+        kl_loss = F.kl_div(
+            log_view_distributions.reshape(-1, num_classes),  # [B*N, num_classes]
+            target_distribution_expanded.reshape(-1, num_classes),  # [B*N, num_classes]
+            reduction='batchmean'
+        )
+        
+        return kl_loss
+
+
+
 
