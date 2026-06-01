@@ -281,13 +281,17 @@ def get_two_stage_config(config: dict) -> dict:
     )
 
     return {
+        # 阶段切换
         'warmup_epochs': max(0, warmup_epochs),
+        'target_update_interval_epochs': target_update_interval_epochs,
+        # 阶段一：Global -> (Local, Fused)
         'teacher_temp': float(two_stage.get('teacher_temp', base_temp)),
         'warmup_student_temp': float(two_stage.get('warmup_student_temp', base_temp)),
         'warmup_local_weight': float(two_stage.get('warmup_local_weight', 1.0)),
         'warmup_fused_weight': float(two_stage.get('warmup_fused_weight', 1.0)),
+        # 阶段二：periodic target update
+        'dec_target_temp': float(two_stage.get('dec_target_temp', 0.05)),
         'dec_student_temp': float(two_stage.get('dec_student_temp', 0.1)),
-        'centering_momentum': float(two_stage.get('centering_momentum', 0.9)),
     }
 
 
@@ -303,12 +307,13 @@ def build_unsupervised_model_name(dataset_name: str, config: dict) -> str:
         f"_dim{stn_cfg.get('hidden_dim', 512)}"
     )
 
+    stage2_kl_weight = float(stn_cfg.get('kl_consistency_weight', 1.0))
     loss_suffix = (
         f"twostage_w{two_stage_cfg['warmup_epochs']}"
-        f"_symmetric"
+        f"_mperiodic_u{two_stage_cfg['target_update_interval_epochs']}"
         f"_tg{two_stage_cfg['teacher_temp']:.3f}"
-        f"_ts{two_stage_cfg['warmup_student_temp']:.3f}"
-        f"_ds{two_stage_cfg['dec_student_temp']:.3f}"
+        f"_td{two_stage_cfg['dec_target_temp']:.3f}"
+        f"_kl{stage2_kl_weight:.2f}"
     )
 
     if stn_cfg.get('fairness_weight', 0.0) > 0:
@@ -378,20 +383,40 @@ def compute_global_logits(model_without_ddp,
     return global_logits_raw
 
 
-def init_centering_buffer(num_classes: int, device: torch.device) -> torch.Tensor:
-    """初始化中心向量为零，shape [num_classes]"""
-    return torch.zeros(num_classes, device=device)
+def build_or_refresh_periodic_teacher(teacher_model,
+                                      student_model_without_ddp,
+                                      device: torch.device):
+    """
+    构建或刷新周期性目标分布teacher模型。
+    teacher在stage2中以固定周期更新参数，用于提供相对静态的目标分布。
+    """
+    if teacher_model is None:
+        with suppress_stdout_if_not_main():
+            teacher_model = MultiViewSTNModel(
+                clip_model=student_model_without_ddp.clip_model,
+                config=student_model_without_ddp.config,
+                num_views=student_model_without_ddp.num_views,
+            ).to(device)
+            teacher_model = teacher_model.float()
+
+    teacher_model.load_state_dict(student_model_without_ddp.state_dict(), strict=True)
+    teacher_model.eval()
+    for p in teacher_model.parameters():
+        p.requires_grad_(False)
+    return teacher_model
 
 
-def update_centering_buffer(c: torch.Tensor, batch_logits: torch.Tensor,
-                            momentum: float) -> torch.Tensor:
-    """EMA 更新中心向量。batch_logits: [B, num_classes]，对 batch 维度求平均"""
+def compute_periodic_target_probs(teacher_model,
+                                  images_448: torch.Tensor,
+                                  text_features: torch.Tensor,
+                                  target_temp: float) -> torch.Tensor:
+    """使用周期性teacher计算当前batch目标分布。"""
     with torch.no_grad():
-        batch_mean = batch_logits.mean(dim=0)
-        if is_dist_avail_and_initialized():
-            dist.all_reduce(batch_mean, op=dist.ReduceOp.AVG)
-        c.data.mul_(momentum).add_(batch_mean, alpha=1.0 - momentum)
-    return c
+        teacher_fused_features, _ = teacher_model(images_448, mode='train')
+        teacher_fused_features = F.normalize(teacher_fused_features.float(), dim=-1)
+        teacher_logits = teacher_fused_features @ text_features
+        target_probs = F.softmax(teacher_logits / max(target_temp, 1e-6), dim=-1)
+    return target_probs
 
 
 def compute_two_stage_unsupervised_loss(criterion,
@@ -403,7 +428,7 @@ def compute_two_stage_unsupervised_loss(criterion,
                                         epoch: int,
                                         global_step: int,
                                         config: dict,
-                                        center_c: torch.Tensor | None = None):
+                                        periodic_target_probs: torch.Tensor | None = None):
     """
     两阶段无监督目标：
     - 阶段一（warmup）：Global -> Local + Global -> Fused
@@ -475,26 +500,23 @@ def compute_two_stage_unsupervised_loss(criterion,
         loss_details['warmup_fused_weighted'] = float((two_stage_cfg['warmup_fused_weight'] * warmup_fused).item())
     else:
         # 阶段二（symmetric）：fused ↔ local 互相作为目标
-        # 对做 teacher 的一侧减去中心向量 c 再 softmax，防止分布坍缩
+        # Path 1: fused → local（fused 做 teacher，训 localization）
+        # Path 2: local → fused（local 共识做 teacher，训 fusion_module）
         dec_student_temp = max(two_stage_cfg['dec_student_temp'], 1e-6)
 
-        if center_c is not None:
-            fused_centered = fused_logits_raw.detach() - center_c.unsqueeze(0)
-            local_mean_logits = view_logits_raw.mean(dim=1)
-            local_centered = local_mean_logits.detach() - center_c.unsqueeze(0)
-        else:
-            fused_centered = fused_logits_raw.detach()
-            local_mean_logits = view_logits_raw.mean(dim=1)
-            local_centered = local_mean_logits.detach()
-
-        fused_probs = F.softmax(fused_centered / dec_student_temp, dim=-1)
+        fused_probs = F.softmax(
+            fused_logits_raw.detach() / dec_student_temp, dim=-1
+        )
         dec_local = _multi_view_kl_from_logits(
             view_logits=view_logits_raw,
             target_probs=fused_probs,
             student_temp=dec_student_temp
         )
 
-        local_mean_probs = F.softmax(local_centered / dec_student_temp, dim=-1)
+        local_mean_logits = view_logits_raw.mean(dim=1)
+        local_mean_probs = F.softmax(
+            local_mean_logits.detach() / dec_student_temp, dim=-1
+        )
         dec_fused = _kl_from_logits(
             student_logits=fused_logits_raw,
             target_probs=local_mean_probs,
@@ -507,6 +529,8 @@ def compute_two_stage_unsupervised_loss(criterion,
         loss_details['dec_local_weighted'] = float(dec_local.item())
         loss_details['dec_fused'] = float(dec_fused.item())
         loss_details['dec_fused_weighted'] = float(dec_fused.item())
+        loss_details['dec_fused'] = 0.0
+        loss_details['dec_fused_weighted'] = 0.0
 
     # === 兼容已有正则项（可选）===
     reg_total = torch.tensor(0.0, device=fused_logits_raw.device, dtype=fused_logits_raw.dtype)
@@ -560,10 +584,10 @@ def unsupervised_train_one_epoch(model: DDP,
                                  epoch: int,
                                  config: dict,
                                  text_features: torch.Tensor,
-                                 center_c: torch.Tensor | None = None):
+                                 teacher_model=None):
     """
     无监督训练一个epoch
-
+    
     注意：不使用标签信息，labels仅用于计算准确率（监控用）
     """
     model.train()
@@ -573,7 +597,6 @@ def unsupervised_train_one_epoch(model: DDP,
 
     temperature = float(config['stn_config'].get('logits_temp', 0.07))
     two_stage_cfg = get_two_stage_config(config)
-    centering_momentum = two_stage_cfg.get('centering_momentum', 0.9)
 
     # 梯度裁剪配置
     max_grad_norm = float(config['training'].get('max_grad_norm', 1.0))
@@ -600,6 +623,19 @@ def unsupervised_train_one_epoch(model: DDP,
         )
         global_logits_raw = torch.matmul(original_features, text_features)
 
+        periodic_target_probs = None
+        if (
+            epoch >= two_stage_cfg['warmup_epochs']
+            and teacher_model is not None
+        ):
+            periodic_target_probs = compute_periodic_target_probs(
+                teacher_model=teacher_model,
+                images_448=images,
+                text_features=text_features,
+                target_temp=two_stage_cfg['dec_target_temp'],
+            )
+
+        # 两阶段损失（阶段一: Global指导；阶段二: DEC式交替）
         loss, loss_details, fused_logits_raw = compute_two_stage_unsupervised_loss(
             criterion=criterion,
             fused_features=fused_features,
@@ -610,12 +646,8 @@ def unsupervised_train_one_epoch(model: DDP,
             epoch=epoch,
             global_step=global_step,
             config=config,
-            center_c=center_c,
+            periodic_target_probs=periodic_target_probs,
         )
-
-        # 更新中心向量（阶段二用 fused_logits 更新）
-        if epoch >= two_stage_cfg['warmup_epochs'] and center_c is not None:
-            update_centering_buffer(center_c, fused_logits_raw, centering_momentum)
 
         # 仅用于监控准确率
         logits_for_acc = fused_logits_raw / temperature
@@ -660,9 +692,8 @@ def unsupervised_train_one_epoch(model: DDP,
             if loss_details.get('phase') == 'warmup':
                 progress_dict['WLoc'] = f"{loss_details.get('warmup_local', 0.0):.3f}/{loss_details.get('warmup_local_weighted', 0.0):.3f}"
                 progress_dict['WFus'] = f"{loss_details.get('warmup_fused', 0.0):.3f}/{loss_details.get('warmup_fused_weighted', 0.0):.3f}"
-            elif loss_details.get('phase') == 'dec_symmetric':
-                progress_dict['Loc'] = f"{loss_details.get('dec_local', 0.0):.3f}"
-                progress_dict['Fus'] = f"{loss_details.get('dec_fused', 0.0):.3f}"
+            elif loss_details.get('phase') == 'dec_periodic':
+                progress_dict['DecP'] = f"{loss_details.get('dec_local', 0.0):.3f}/{loss_details.get('dec_local_active', 0.0):.3f}"
 
             # 显示正则项损失分量
             if getattr(criterion, 'classification_weight', 0.0) > 0:
@@ -706,7 +737,7 @@ def unsupervised_validate(model: DDP,
                           epoch: int,
                           config: dict,
                           text_features: torch.Tensor,
-                          center_c: torch.Tensor | None = None):
+                          teacher_model=None):
     """无监督验证"""
     model.eval()
 
@@ -734,6 +765,18 @@ def unsupervised_validate(model: DDP,
             )
             global_logits_raw = torch.matmul(original_features, text_features)
 
+            periodic_target_probs = None
+            if (
+                epoch >= two_stage_cfg['warmup_epochs']
+                and teacher_model is not None
+            ):
+                periodic_target_probs = compute_periodic_target_probs(
+                    teacher_model=teacher_model,
+                    images_448=images,
+                    text_features=text_features,
+                    target_temp=two_stage_cfg['dec_target_temp'],
+                )
+
             loss, loss_details, fused_logits_raw = compute_two_stage_unsupervised_loss(
                 criterion=criterion,
                 fused_features=fused_features,
@@ -744,7 +787,7 @@ def unsupervised_validate(model: DDP,
                 epoch=epoch,
                 global_step=global_step,
                 config=config,
-                center_c=center_c,
+                periodic_target_probs=periodic_target_probs,
             )
 
             similarity = fused_logits_raw / temperature
@@ -765,8 +808,7 @@ def unsupervised_validate(model: DDP,
                     progress_dict['wloc'] = f"{loss_details.get('warmup_local', 0.0):.3f}/{loss_details.get('warmup_local_weighted', 0.0):.3f}"
                     progress_dict['wfus'] = f"{loss_details.get('warmup_fused', 0.0):.3f}/{loss_details.get('warmup_fused_weighted', 0.0):.3f}"
                 else:
-                    progress_dict['loc'] = f"{loss_details.get('dec_local', 0.0):.3f}"
-                    progress_dict['fus'] = f"{loss_details.get('dec_fused', 0.0):.3f}"
+                    progress_dict['decp'] = f"{loss_details.get('dec_local', 0.0):.3f}/{loss_details.get('dec_local_weighted', 0.0):.3f}"
                 if getattr(criterion, 'classification_weight', 0.0) > 0:
                     progress_dict['cls'] = f"{loss_details.get('classification', 0.0):.3f}/{loss_details.get('classification_weighted', 0.0):.3f}"
                 if getattr(criterion, 'fairness_weight', 0.0) > 0:
@@ -963,11 +1005,6 @@ def main():
     patience_counter = 0
     start_epoch = 0
 
-    # 中心向量（防坍缩）
-    num_classes = all_classes_text_features.shape[1]
-    center_c = init_centering_buffer(num_classes, device)
-    centering_momentum = two_stage_cfg.get('centering_momentum', 0.9)
-
     # 断点续训
     if os.path.exists(ckpt_latest):
         if is_main_process():
@@ -1017,17 +1054,38 @@ def main():
         print(f"  - 两阶段训练:")
         print(f"    * Warmup轮数: {two_stage_cfg['warmup_epochs']}")
         print(f"    * 阶段一(Global->Local/Fused): 温度(T_teacher={two_stage_cfg['teacher_temp']}, T_student={two_stage_cfg['warmup_student_temp']}), 权重(Local={two_stage_cfg['warmup_local_weight']}, Fused={two_stage_cfg['warmup_fused_weight']})")
-        print(f"    * 阶段二(symmetric): 温度(T={two_stage_cfg['dec_student_temp']}), fused↔local 对称一致性")
+        print(f"    * 阶段二(周期目标): 温度(T_target={two_stage_cfg['dec_target_temp']}, T_student={two_stage_cfg['dec_student_temp']}), KL权重(kl_consistency_weight)={stage2_kl_weight}, 目标刷新间隔={two_stage_cfg['target_update_interval_epochs']} epochs")
         print(f"  - 额外正则:")
         print(f"    * 公平性正则化: {stn_cfg.get('fairness_weight', 0.0)}")
         print(f"    * 特征去相关: {stn_cfg.get('decorrelation_weight', 0.0)}")
         print(f"  - 模型保存: {ckpt_dir}")
         print()
 
+    teacher_model = None
 
     # 训练循环
     for epoch in range(start_epoch, total_epochs):
         model_without_ddp = stn_model.module if hasattr(stn_model, 'module') else stn_model
+
+        # 阶段二周期性刷新teacher目标模型（按epoch刷新）
+        if epoch >= two_stage_cfg['warmup_epochs']:
+            stage2_epoch_idx = epoch - two_stage_cfg['warmup_epochs']
+            should_refresh_teacher = (
+                teacher_model is None or
+                (stage2_epoch_idx % two_stage_cfg['target_update_interval_epochs'] == 0)
+            )
+            if should_refresh_teacher:
+                teacher_model = build_or_refresh_periodic_teacher(
+                    teacher_model=teacher_model,
+                    student_model_without_ddp=model_without_ddp,
+                    device=device,
+                )
+                if is_main_process():
+                    print(
+                        f"🔄 阶段二周期目标已刷新: epoch={epoch+1}, "
+                        f"refresh_interval={two_stage_cfg['target_update_interval_epochs']} epochs"
+                    )
+
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -1040,7 +1098,7 @@ def main():
             epoch=epoch,
             config=config,
             text_features=all_classes_text_features,
-            center_c=center_c,
+            teacher_model=teacher_model,
         )
 
         val_loss, val_acc = unsupervised_validate(
@@ -1051,6 +1109,105 @@ def main():
             epoch=epoch,
             config=config,
             text_features=all_classes_text_features,
-            center_c=center_c,
+            teacher_model=teacher_model,
         )
 
+        if scheduler is not None:
+            scheduler.step()
+
+        if is_main_process():
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch+1}/{total_epochs} | Train: loss={train_loss:.4f}, acc={train_acc:.3f} | "
+                  f"Val: loss={val_loss:.4f}, acc={val_acc:.3f} | lr={current_lr:.2e}")
+
+            # 只保存最佳验证损失的模型
+            if val_loss < best_val_loss:
+                improvement = best_val_loss - val_loss
+                best_val_loss = val_loss
+                best_loss_acc = val_acc
+                best_loss_epoch = epoch + 1
+                patience_counter = 0
+
+                to_save_state = stn_model.module.state_dict() if hasattr(stn_model, 'module') else stn_model.state_dict()
+                torch.save(to_save_state, ckpt_best_loss)
+                print(f"  🎯 验证损失改善 -{improvement:.6f}! 新最佳Loss: {best_val_loss:.6f}, Acc: {best_loss_acc:.3f} (第{best_loss_epoch}轮)")
+                print(f"  💾 已保存最佳模型: {ckpt_best_loss}")
+            else:
+                patience_counter += 1
+                print(f"  ⏳ 验证损失未改善 {patience_counter}/{patience} 轮")
+            
+            # 保存最新检查点（用于断点续训）
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': stn_model.module.state_dict() if hasattr(stn_model, 'module') else stn_model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+                'best_val_loss': best_val_loss,
+                'best_loss_acc': best_loss_acc,
+                'best_loss_epoch': best_loss_epoch,
+                'patience_counter': patience_counter,
+                'train_loss': train_loss,
+                'train_acc': train_acc,
+                'val_loss': val_loss,
+                'val_acc': val_acc,
+            }
+            torch.save(checkpoint, ckpt_latest)
+            print(f"  💾 已保存最新检查点: {ckpt_latest}")
+
+            if patience_counter >= patience:
+                print("🛑 早停触发，结束训练")
+                break
+
+        # 同步早停决定（确保所有进程同步）
+        should_stop = False
+        if is_dist_avail_and_initialized():
+            # 主进程决定是否早停
+            stop_flag = torch.tensor(1 if (is_main_process() and patience_counter >= patience) else 0, 
+                                    dtype=torch.int32, device=device)
+            dist.broadcast(stop_flag, src=0)
+            should_stop = (stop_flag.item() == 1)
+        else:
+            # 单卡训练
+            should_stop = (patience_counter >= patience)
+        
+        if should_stop:
+            if is_main_process():
+                print("🛑 所有进程同步早停")
+            break
+
+        # 清理缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # 训练完成
+    if is_main_process():
+        print("\n🎉 无监督分布式训练完成")
+        print(f"🏆 最佳模型: Epoch {best_loss_epoch}, Val Loss={best_val_loss:.6f}, Val Acc={best_loss_acc:.3f}")
+        print(f"💾 模型保存位置: {ckpt_best_loss}")
+
+    # 清理
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:
+        pass
+
+    try:
+        del train_loader
+        del val_loader
+    except Exception:
+        pass
+
+    if is_dist_avail_and_initialized():
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+
+if __name__ == '__main__':
+    main()
