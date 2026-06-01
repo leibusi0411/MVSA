@@ -19,13 +19,13 @@ stn_config:
   transformer_layers: 2
   transformer_dropout: 0.1
 
-  logits_temp: 0.07
+  logits_temp: 0.07   #只做准确率计算
 
   fairness_weight: 0.0
   decorrelation_weight: 0.0
 
   two_stage:
-    warmup_epochs: 8
+    warmup_epochs: 15
 
     teacher_temp: 0.05   #CLIP教师温度参数  尖锐一点好   教师比学生尖锐一点
     warmup_student_temp: 0.09   # local 和 fused 共用  学生温度参数
@@ -34,6 +34,7 @@ stn_config:
     warmup_fused_weight: 1.0
 
     dec_student_temp: 0.15
+    centering_momentum: 0.9   # teacher logits softmax前减去中心向量
 
 # === 训练配置 ===
 training:

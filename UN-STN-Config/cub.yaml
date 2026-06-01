@@ -30,7 +30,7 @@ stn_config:
 
   # === 两阶段无监督训练配置 ===
   two_stage:
-    warmup_epochs: 8             # 阶段一持续的epoch数（细粒度任务可适当更长）
+    warmup_epochs: 15             # 阶段一持续的epoch数（细粒度任务可适当更长）
 
     # 阶段一参数（冻结CLIP teacher → Local + Fused）
     teacher_temp: 0.05   # CLIP教师温度 尖锐一点好           # 冻结CLIP teacher目标分布温度
@@ -40,6 +40,7 @@ stn_config:
 
     # 阶段二参数（fused ↔ local 对称一致性）
     dec_student_temp: 0.15       # 两个KL共享的温度参数
+    centering_momentum: 0.9   # teacher logits softmax前减去中心向量
 
 # === 训练配置 ===
 training:

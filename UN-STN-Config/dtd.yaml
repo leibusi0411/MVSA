@@ -25,7 +25,7 @@ stn_config:
   decorrelation_weight: 0.0
 
   two_stage:
-    warmup_epochs: 8
+    warmup_epochs: 15
 
     teacher_temp: 0.05   # CLIP教师温度 尖锐一点好
     warmup_student_temp: 0.09   # 学生温度 比教师软
@@ -33,6 +33,7 @@ stn_config:
     warmup_fused_weight: 1.0
 
     dec_student_temp: 0.15
+    centering_momentum: 0.9   # teacher logits softmax前减去中心向量
 
 # === 训练配置 ===
 training:
