@@ -104,7 +104,8 @@ def load_multi_view_dataset(dataset_name: str,
                            target_size: int = 448,
                            scale_short_edge: int = 512,
                            flip_prob: float = 0.5,
-                           center_crop: bool = False) -> DataLoader:
+                           center_crop: bool = False,
+                           persistent_workers: bool | None = None) -> DataLoader:
     """
     统一的数据加载器 - 新架构
     直接使用基础数据集类 + transform，无需MultiViewDataset包装
@@ -165,7 +166,7 @@ def load_multi_view_dataset(dataset_name: str,
         shuffle=is_train,  # 训练时打乱，验证/测试时保持顺序
         num_workers=num_workers,
         pin_memory=True,  # 加速GPU传输
-        persistent_workers=True if num_workers > 0 else False,  # 🔥 保持worker进程活跃，避免重复创建
+        persistent_workers=(persistent_workers if persistent_workers is not None else num_workers > 0),
         prefetch_factor=2 if num_workers > 0 else None,  # 🔥 每个worker预取2个batch，减少等待时间
         drop_last=is_train,  # 训练时丢弃不完整批次，验证/测试时保留所有样本
         collate_fn=collate_fn  # 使用安全的collate函数

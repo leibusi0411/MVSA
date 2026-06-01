@@ -239,14 +239,13 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
     parser.add_argument('--device', type=str, default=None, help='计算设备(cuda/cpu)')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--ckpt_path', type=str, default=None,
+                        help='直接指定检查点文件路径（优先级最高）')
     parser.add_argument('--visual_batches', type=int, default=10,
-                        help='前N个batch保存可视化图片（仅支持>=1）')
+                        help='前N个batch保存可视化图片，0表示不保存')
     parser.add_argument('--max_vis_samples', type=int, default=0,
                         help='每个可视化batch最多保存样本数；0表示保存整个batch')
     args = parser.parse_args()
-
-    if args.visual_batches <= 0:
-        raise ValueError("--visual_batches 必须 >= 1；该脚本仅支持可视化模式")
 
     if args.device is None:
         args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -303,6 +302,7 @@ def main():
             scale_short_edge=512,
             flip_prob=0.0,
             center_crop=True,
+            persistent_workers=False,
         )
 
         model_name = model_size.replace('/', '_')
@@ -312,9 +312,12 @@ def main():
 
         precomputed_text_features = torch.load(text_features_path, map_location=args.device).float().to(args.device)
 
-        # 只测试best模型（根据数据集对应配置自动构建路径）
+        # 检查点路径：优先使用 --ckpt_path，否则从配置构造
         ckpt_tag = 'best'
-        ckpt_path = build_unsupervised_checkpoint_paths(config_dataset, config)['best']
+        if args.ckpt_path:
+            ckpt_path = args.ckpt_path
+        else:
+            ckpt_path = build_unsupervised_checkpoint_paths(config_dataset, config)['best']
 
         max_samples = None if args.max_vis_samples == 0 else args.max_vis_samples
 
