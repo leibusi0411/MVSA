@@ -1017,7 +1017,7 @@ def main():
         print(f"  - 两阶段训练:")
         print(f"    * Warmup轮数: {two_stage_cfg['warmup_epochs']}")
         print(f"    * 阶段一(Global->Local/Fused): 温度(T_teacher={two_stage_cfg['teacher_temp']}, T_student={two_stage_cfg['warmup_student_temp']}), 权重(Local={two_stage_cfg['warmup_local_weight']}, Fused={two_stage_cfg['warmup_fused_weight']})")
-        print(f"    * 阶段二(周期目标): 温度(T_target={two_stage_cfg['dec_target_temp']}, T_student={two_stage_cfg['dec_student_temp']}), KL权重(kl_consistency_weight)={stage2_kl_weight}, 目标刷新间隔={two_stage_cfg['target_update_interval_epochs']} epochs")
+        print(f"    * 阶段二(symmetric): 温度(T={two_stage_cfg['dec_student_temp']}), fused↔local 对称一致性")
         print(f"  - 额外正则:")
         print(f"    * 公平性正则化: {stn_cfg.get('fairness_weight', 0.0)}")
         print(f"    * 特征去相关: {stn_cfg.get('decorrelation_weight', 0.0)}")
