@@ -1,140 +1,230 @@
 #!/bin/bash
-# 断点续训启动脚本（支持nohup后台运行）
-# 用法: ./resume_train.sh [dataset] [num_gpus] [num_workers] [use_nohup]
-# 示例: 
-#   ./resume_train.sh imagenet 2 4 yes    # 后台运行
-#   ./resume_train.sh imagenet 2 4 no     # 前台运行（默认）
+# 超参数调试脚本：一次性测试同一参数的不同值，观察参数对性能的影响
+#
+# 用法:
+#   ./resume_train.sh <dataset> <param_name> <value1,value2,...> [num_gpus] [num_workers]
+#
+# 示例:
+#   ./resume_train.sh cub kl 0.1,0.5,1.0,2.0 2 8
+#   ./resume_train.sh oxford_pets dec_t 0.03,0.05,0.07,0.1 2 8
+#   ./resume_train.sh dtd lr 1e-5,5e-5,1e-4 2 8
+#
+# 支持的参数名（短名 → YAML路径）:
+#   kl        → stn_config.kl_consistency_weight
+#   dec       → stn_config.decorrelation_weight
+#   fair      → stn_config.fairness_weight
+#   lr        → training.learning_rate
+#   dec_t     → stn_config.two_stage.dec_target_temp
+#   stu_t     → stn_config.two_stage.dec_student_temp
+#   warm_t    → stn_config.two_stage.warmup_student_temp
+#   teacher_t → stn_config.two_stage.teacher_temp
+#   ema_m     → stn_config.two_stage.ema_momentum
+#   warm_ep   → stn_config.two_stage.warmup_epochs
+#   也支持直接用 YAML 点路径，如 stn_config.kl_consistency_weight
 
-set -e  # 遇到错误立即退出
+# ============================================================================
+# 参数解析
+# ============================================================================
+DATASET=${1:?请指定数据集名称}
+PARAM_NAME=${2:?请指定要调试的参数名}
+VALUES_STR=${3:?请指定参数值列表（逗号分隔）}
+NUM_GPUS=${4:-2}
+NUM_WORKERS=${5:-8}
 
-# 默认参数
-DATASET=${1:-imagenet}
-NUM_GPUS=${2:-2}
-NUM_WORKERS=${3:-4}
-USE_NOHUP=${4:-yes}  # 默认使用nohup
+# Conda 环境
+CONDA_ENV="wca"
+CONDA_PYTHON="/mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/anaconda3/envs/wca/bin/python"
 
-echo "=========================================="
-echo "  断点续训启动脚本"
-echo "=========================================="
-echo "数据集: $DATASET"
-echo "GPU数量: $NUM_GPUS"
-echo "DataLoader Workers: $NUM_WORKERS"
-echo "后台运行: $USE_NOHUP"
-echo ""
+# 解析值列表
+IFS=',' read -ra VALUES <<< "$VALUES_STR"
 
-# 设置日志文件
-LOG_DIR="logs"
-mkdir -p "$LOG_DIR"
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-LOG_FILE="${LOG_DIR}/train_${DATASET}_${TIMESTAMP}.log"
-echo "📝 日志文件: $LOG_FILE"
-echo ""
+# 参数名 → YAML 点路径 映射
+declare -A PARAM_MAP=(
+    ["kl"]="stn_config.kl_consistency_weight"
+    ["dec"]="stn_config.decorrelation_weight"
+    ["fair"]="stn_config.fairness_weight"
+    ["lr"]="training.learning_rate"
+    ["dec_t"]="stn_config.two_stage.dec_target_temp"
+    ["stu_t"]="stn_config.two_stage.dec_student_temp"
+    ["warm_t"]="stn_config.two_stage.warmup_student_temp"
+    ["teacher_t"]="stn_config.two_stage.teacher_temp"
+    ["ema_m"]="stn_config.two_stage.ema_momentum"
+    ["warm_ep"]="stn_config.two_stage.warmup_epochs"
+)
 
-# 检查配置文件
-CONFIG_FILE="STN-Config/${DATASET}.yaml"
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "❌ 错误: 配置文件不存在: $CONFIG_FILE"
+# 解析 YAML 路径
+if [[ "$PARAM_NAME" == *"."* ]]; then
+    YAML_PATH="$PARAM_NAME"
+else
+    YAML_PATH="${PARAM_MAP[$PARAM_NAME]:-}"
+    if [ -z "$YAML_PATH" ]; then
+        echo "❌ 未知参数名: $PARAM_NAME"
+        echo "   支持的短名: ${!PARAM_MAP[*]}"
+        echo "   也支持直接使用 YAML 点路径"
+        exit 1
+    fi
+fi
+
+# 配置文件路径（默认无监督）
+BASE_CONFIG="UN-STN-Config/${DATASET}.yaml"
+if [ ! -f "$BASE_CONFIG" ]; then
+    echo "❌ 配置文件不存在: $BASE_CONFIG"
     exit 1
 fi
 
-echo "✅ 配置文件: $CONFIG_FILE"
+# 日志目录
+LOG_DIR="logs/sweeps"
+mkdir -p "$LOG_DIR"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
-# 检查是否存在检查点
-CKPT_DIR="checkpoints/${DATASET}"
-LATEST_CKPT=$(find "$CKPT_DIR" -name "*_latest.pth" 2>/dev/null | head -1)
+# 参数显示名
+PARAM_SHORT=$(echo "$YAML_PATH" | sed 's/.*\.//')
+TOTAL_RUNS=${#VALUES[@]}
 
-if [ -n "$LATEST_CKPT" ]; then
-    echo "🔄 发现检查点: $LATEST_CKPT"
-    echo "   将从上次中断处继续训练"
-    
-    # 显示检查点信息
-    python -c "
-import torch
-import os
-ckpt = torch.load('$LATEST_CKPT', map_location='cpu')
-print(f'   - Epoch: {ckpt[\"epoch\"]+1}')
-print(f'   - 最佳Loss: {ckpt[\"best_val_loss\"]:.6f}')
-print(f'   - 最佳Acc: {ckpt.get(\"best_val_accuracy\", ckpt.get(\"best_val_acc\", 0)):.3f}')
-" 2>/dev/null || echo "   (无法读取检查点详情)"
-else
-    echo "🆕 未找到检查点，将从头开始训练"
-fi
-
-echo ""
-echo "=========================================="
-echo "  开始训练"
-echo "=========================================="
+echo "=============================================="
+echo "  超参数调试（无监督训练）"
+echo "=============================================="
+echo "数据集:      $DATASET"
+echo "配置文件:    $BASE_CONFIG"
+echo "调试参数:    $YAML_PATH ($PARAM_NAME)"
+echo "参数值:      ${VALUES[*]}"
+echo "运行次数:    $TOTAL_RUNS"
+echo "GPU数量:     $NUM_GPUS"
+echo "Workers:     $NUM_WORKERS"
+echo "时间戳:      $TIMESTAMP"
+echo "=============================================="
 echo ""
 
-# 清理GPU缓存
-if command -v nvidia-smi &> /dev/null; then
-    echo "🧹 清理GPU缓存..."
-    nvidia-smi --gpu-reset 2>/dev/null || true
-fi
+# 退出时清理临时配置文件
+cleanup() { rm -f /tmp/sweep_*_${TIMESTAMP}.yaml; }
+trap cleanup EXIT
 
-# 构建训练命令
-if [ "$NUM_GPUS" -gt 1 ]; then
-    TRAIN_CMD="torchrun --nproc_per_node=$NUM_GPUS train_ddp_stn.py --dataset $DATASET --stn_config $DATASET --num_workers $NUM_WORKERS --seed 42"
-else
-    TRAIN_CMD="python main_stn.py --dataset_name $DATASET --stn_config $DATASET --num_workers $NUM_WORKERS --seed 42 --device cuda"
-fi
+# 汇总文件
+SUMMARY_FILE="${LOG_DIR}/summary_${DATASET}_${PARAM_SHORT}_${TIMESTAMP}.txt"
 
-# 启动训练
-if [ "$USE_NOHUP" = "yes" ] || [ "$USE_NOHUP" = "y" ]; then
-    echo "🚀 启动后台训练（nohup模式）..."
-    echo "   命令: $TRAIN_CMD"
-    echo "   日志: $LOG_FILE"
+# ============================================================================
+# 主循环
+# ============================================================================
+RUN_IDX=0
+declare -a RESULTS
+
+for VAL in "${VALUES[@]}"; do
+    RUN_IDX=$((RUN_IDX + 1))
+
+    VAL=$(echo "$VAL" | xargs)
+    VAL_SAFE=$(echo "$VAL" | sed 's/\./-/g' | sed 's/e/E/g')
+
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "  [$RUN_IDX/$TOTAL_RUNS] $PARAM_SHORT = $VAL"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    # 生成临时配置文件
+    TEMP_CONFIG="/tmp/sweep_${DATASET}_${PARAM_SHORT}_${VAL_SAFE}_${TIMESTAMP}.yaml"
+    $CONDA_PYTHON -c "
+import yaml
+with open('$BASE_CONFIG', 'r') as f:
+    config = yaml.safe_load(f)
+
+path = '$YAML_PATH'.split('.')
+val_str = '$VAL'
+
+try:
+    if '.' in val_str or 'e' in val_str.lower():
+        val = float(val_str)
+    else:
+        val = int(val_str)
+except ValueError:
+    val = val_str
+
+d = config
+for key in path[:-1]:
+    if key not in d:
+        d[key] = {}
+    d = d[key]
+d[path[-1]] = val
+
+with open('$TEMP_CONFIG', 'w') as f:
+    yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+print(f'  → $YAML_PATH = {val} ({type(val).__name__})')
+"
+
+    LOG_FILE="${LOG_DIR}/sweep_${DATASET}_${PARAM_SHORT}_${VAL_SAFE}_${TIMESTAMP}.log"
+
+    echo "  → 日志: $LOG_FILE"
     echo ""
-    echo "💡 提示:"
-    echo "   - 查看实时日志: tail -f $LOG_FILE"
-    echo "   - 查看训练进程: ps aux | grep train"
-    echo "   - 停止训练: pkill -f 'train_ddp_stn.py|main_stn.py'"
+
+    # 运行训练（直接用 conda python，避免 conda run 缓冲问题）
+    echo "🚀 开始训练..."
+    $CONDA_PYTHON -u -m torch.distributed.run \
+        --nproc_per_node=$NUM_GPUS \
+        train_unsupervised_ddp.py \
+        --dataset $DATASET \
+        --config $TEMP_CONFIG \
+        --num_workers $NUM_WORKERS \
+        --seed 42 \
+        > "$LOG_FILE" 2>&1
+    EXIT_CODE=$?
+
+    # 提取关键结果
+    BEST_LINE=$(grep "新最佳Loss" "$LOG_FILE" | tail -1 | sed 's/.*新最佳Loss: //' | sed 's/,/ /g')
+    LAST_EPOCH=$(grep "^Epoch " "$LOG_FILE" | tail -1 | sed 's/  / /g')
+    EARLY_STOP=$(grep "早停触发" "$LOG_FILE" | wc -l)
+
     echo ""
-    
-    # 使用nohup在后台运行，输出重定向到日志文件
-    nohup $TRAIN_CMD > "$LOG_FILE" 2>&1 &
-    
-    # 获取进程ID
-    TRAIN_PID=$!
-    echo "✅ 训练已在后台启动"
-    echo "   进程ID: $TRAIN_PID"
-    echo "   日志文件: $LOG_FILE"
-    echo ""
-    echo "🔍 等待3秒检查进程状态..."
-    sleep 3
-    
-    if ps -p $TRAIN_PID > /dev/null; then
-        echo "✅ 训练进程运行正常"
-        echo ""
-        echo "📊 最新日志（前20行）:"
-        echo "----------------------------------------"
-        head -20 "$LOG_FILE" 2>/dev/null || echo "日志文件尚未生成"
-        echo "----------------------------------------"
-        echo ""
-        echo "💡 使用以下命令查看实时日志:"
-        echo "   tail -f $LOG_FILE"
+    if [ $EXIT_CODE -ne 0 ]; then
+        echo "⚠️  训练退出码: $EXIT_CODE"
+        RESULT="$VAL | EXIT=$EXIT_CODE"
     else
-        echo "❌ 训练进程启动失败，请检查日志:"
-        echo "   cat $LOG_FILE"
-        exit 1
+        echo "✅ 训练完成"
+        RESULT="$VAL | $LAST_EPOCH"
     fi
-else
-    echo "🚀 启动前台训练..."
-    echo "   命令: $TRAIN_CMD"
+    if [ -n "$BEST_LINE" ]; then
+        echo "  📊 最佳: $BEST_LINE"
+        RESULT="$RESULT | Best: $BEST_LINE"
+    fi
+    if [ "$EARLY_STOP" -gt 0 ]; then
+        echo "  ⏳ 触发早停"
+        RESULT="$RESULT | 早停"
+    fi
     echo ""
-    
-    # 前台运行，同时输出到终端和日志文件
-    $TRAIN_CMD 2>&1 | tee "$LOG_FILE"
-    
-    echo ""
-    echo "=========================================="
-    echo "  训练完成或中断"
-    echo "=========================================="
-fi
 
-# 显示最终检查点
-if [ -d "$CKPT_DIR" ]; then
+    RESULTS+=("$RESULT")
+
+    # 清理临时配置
+    rm -f "$TEMP_CONFIG"
+done
+
+# ============================================================================
+# 汇总
+# ============================================================================
+echo "=============================================="
+echo "  全部实验完成"
+echo "=============================================="
+echo ""
+echo "📊 结果汇总:"
+echo "  $YAML_PATH"
+echo ""
+
+for r in "${RESULTS[@]}"; do
+    echo "  $r"
+done
+
+# 写入汇总文件
+{
+    echo "超参数调试汇总"
+    echo "数据集: $DATASET"
+    echo "参数: $YAML_PATH"
+    echo "时间: $TIMESTAMP"
+    echo "=========================================="
+    for r in "${RESULTS[@]}"; do
+        echo "$r"
+    done
     echo ""
-    echo "📁 保存的检查点:"
-    ls -lh "$CKPT_DIR"/*.pth 2>/dev/null | awk '{printf "   %s (%s)\n", $9, $5}' || echo "   无检查点"
-fi
+    echo "详细日志: $LOG_DIR/sweep_${DATASET}_${PARAM_SHORT}_*_${TIMESTAMP}.log"
+} > "$SUMMARY_FILE"
+
+echo ""
+echo "📁 汇总文件: $SUMMARY_FILE"
+echo "📁 日志目录: $LOG_DIR/"
+echo "📁 检查点目录: checkpoints/unsupervised/$DATASET/"

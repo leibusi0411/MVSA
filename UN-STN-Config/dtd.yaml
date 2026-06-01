@@ -1,0 +1,82 @@
+# 无监督STN配置 - DTD (Describable Textures Dataset) 纹理数据集
+# 用于无监督训练实验（不使用标签信息）
+# EMA teacher 模式
+
+# === 基础模型配置 ===
+model_size: ViT-B/32
+dataset: dtd
+data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/WCA/data/dtd
+
+
+# === STN核心配置 ===
+stn_config:
+  # 网络架构参数
+  hidden_dim: 256
+  dropout: 0.1
+  num_views: 4
+  fusion_mode: transformer
+
+  # Transformer融合配置
+  transformer_heads: 8
+  transformer_layers: 2
+  transformer_dropout: 0.1
+
+  # === 温度参数配置 ===
+  logits_temp: 0.07
+
+  # === 无监督损失权重配置 ===
+  kl_consistency_weight: 1.0
+  fairness_weight: 0.0
+  decorrelation_weight: 0.1
+
+  # === 两阶段无监督训练配置（EMA teacher 模式） ===
+  # 阶段一（warmup）: Global -> Local + Global -> Fused（冻结 CLIP 引导）
+  # 阶段二（EMA teacher）: EMA 平滑更新的 teacher 分布监督 Local
+  two_stage:
+    warmup_epochs: 10
+    target_update_mode: periodic
+    target_update_interval_epochs: 3
+    ema_momentum: 0.999
+
+    # Centering 参数（teacher logits softmax 前减去中心向量，防止 one-hot 主导）
+    centering_momentum: 0.9
+
+    # 阶段一参数（Global -> Local + Global -> Fused）
+    teacher_temp: 0.07
+    warmup_student_temp: 0.1
+    warmup_local_weight: 1.0
+    warmup_fused_weight: 1.0
+
+    # 阶段二参数
+    dec_target_temp: 0.07
+    dec_student_temp: 0.1
+
+# === 训练配置 ===
+training:
+  # 基础训练参数
+  epochs: 100
+  batch_size: 64
+  num_workers: 8
+
+  # 优化器配置
+  optimizer: adamw
+  learning_rate: 5e-5
+  weight_decay: 1e-2
+  beta1: 0.9
+  beta2: 0.999
+  eps: 1e-8
+  mixed_precision: false
+
+  # 早停配置
+  patience: 8
+
+  # 学习率调度
+  eta_min: 1e-6
+
+  # 学习率预热（仅用于 optimizer LR，不控制 two_stage 阶段切换）
+  warmup_epochs: 5
+  warmup_factor: 0.1
+
+  # 梯度裁剪
+  max_grad_norm: 1.0
+  grad_norm_type: 2.0

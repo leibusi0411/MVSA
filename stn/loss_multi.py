@@ -256,51 +256,55 @@ class ClassificationLoss(nn.Module):
 class FeatureDecorrelationLoss(nn.Module):
     """
     特征级去相关损失
-    
+
     核心思想：
     1. 计算N个视角特征的两两相似度矩阵（余弦相似度）
     2. 理想的相似度矩阵应该是单位矩阵（不同视角完全正交）
     3. 计算当前相似度矩阵与单位矩阵的MSE损失
     4. 鼓励不同视角学习不相关的特征表示，实现互补
     """
-    
+
     def __init__(self):
         super().__init__()
-        
-    def forward(self, view_features):
+        self._cached_eye = None
+
+    def forward(self, view_features, normalized=False):
         """
         计算特征去相关损失
-        
+
         Args:
             view_features (torch.Tensor): 多视角特征 [B, N, D]
-                                        必须已经过L2归一化
-             
+            normalized (bool): 如果为True，表示输入特征已经过L2归一化
+
         Returns:
             torch.Tensor: 去相关损失标量
         """
         batch_size, num_views, feature_dim = view_features.shape
-        
+
         # === 步骤1: 确保特征已经L2归一化 ===
-        view_features_norm = F.normalize(view_features, p=2, dim=-1)  # [B, N, D]
-        
+        if normalized:
+            view_features_norm = view_features
+        else:
+            view_features_norm = F.normalize(view_features, p=2, dim=-1)  # [B, N, D]
+
         # === 步骤2: 计算相似度矩阵（余弦相似度）===
-        # 对每个batch计算N×N的相似度矩阵
         similarity_matrices = torch.bmm(
             view_features_norm,  # [B, N, D]
             view_features_norm.transpose(1, 2)  # [B, D, N]
         )  # [B, N, N]
-        
-        # === 步骤3: 创建理想的单位矩阵   对角线为1，其他为0
-        identity_matrix = torch.eye(
-            num_views, 
-            device=view_features.device, 
-            dtype=view_features.dtype
-        ).unsqueeze(0).expand(batch_size, -1, -1)  # [B, N, N]
-        
+
+        # === 步骤3: 缓存的单位矩阵 ===
+        if self._cached_eye is None or self._cached_eye.shape[0] != num_views:
+            self._cached_eye = torch.eye(
+                num_views,
+                device=view_features.device,
+                dtype=view_features.dtype
+            )
+        identity_matrix = self._cached_eye.unsqueeze(0).expand(batch_size, -1, -1)  # [B, N, N]
+
         # === 步骤4: 计算MSE损失 ===
-        # 计算当前相似度矩阵与单位矩阵的均方误差
         mse_loss = F.mse_loss(similarity_matrices, identity_matrix)
-        
+
         return mse_loss
 
 
@@ -436,22 +440,26 @@ class FairnessRegularizationLoss(nn.Module):
     def __init__(self):
         super().__init__()
     
-    def forward(self, view_features, text_features):
+    def forward(self, view_features, text_features, normalized=False):
         """
         计算公平性正则化损失
-        
+
         Args:
             view_features (torch.Tensor): 多视角特征 [B, N, D]
             text_features (torch.Tensor): 文本特征 [D, num_classes]
-            
+            normalized (bool): 如果为True，表示输入特征已经过L2归一化
+
         Returns:
             torch.Tensor: 公平性正则化损失标量
         """
         batch_size, num_views, feature_dim = view_features.shape
         num_classes = text_features.shape[1]
-        
+
         # === 步骤1: 确保特征已经L2归一化 ===
-        view_features_norm = F.normalize(view_features, p=2, dim=-1)  # [B, N, D]
+        if normalized:
+            view_features_norm = view_features
+        else:
+            view_features_norm = F.normalize(view_features, p=2, dim=-1)  # [B, N, D]
         text_features_norm = F.normalize(text_features, p=2, dim=0)  # [D, num_classes]
         
         # === 步骤2: 计算所有视角的logits ===
