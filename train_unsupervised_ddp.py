@@ -864,19 +864,19 @@ def main():
     # 设置随机种子
     set_seed(args.seed + get_rank())
 
-    # 读取配置（从UN-STN-Config目录）
+    # 读取配置（支持绝对路径、UN-STN-Config目录）
     if args.config:
-        # 用户指定了配置文件
-        if args.config.startswith('UN-STN-Config/'):
+        if os.path.exists(args.config):
+            config_path = args.config
+        elif args.config.startswith('UN-STN-Config/'):
             config_path = args.config
         elif args.config.endswith('.yaml'):
             config_path = f"UN-STN-Config/{args.config}"
         else:
             config_path = f"UN-STN-Config/{args.config}.yaml"
     else:
-        # 默认使用数据集名称作为配置文件名
         config_path = f"UN-STN-Config/{args.dataset}.yaml"
-    
+
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
 
