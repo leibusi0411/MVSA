@@ -1,12 +1,12 @@
-# 无监督STN配置 - Oxford Pets 宠物分类数据集
+# 无监督STN配置 - DTD 纹理分类数据集
 # 用于无监督训练实验（不使用标签信息）
 # 阶段一: 冻结CLIP → Local + Fused
 # 阶段二: fused ↔ local 对称一致性
 
 # === 基础模型配置 ===
 model_size: ViT-B/32
-dataset: oxford_pets
-data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/WCA/data/oxford_pets
+dataset: dtd
+data_path: /mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/project/WCA/data/dtd
 
 # === STN核心配置 ===
 stn_config:
