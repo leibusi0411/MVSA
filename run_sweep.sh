@@ -1,15 +1,12 @@
 #!/bin/bash
 # 参数扫描脚本：多数据集 × 多参数 → 训练 → 测试 → 记录
 #
-# 用法:
-#   # 单参数
+# 用法1 — 直接编辑本文件中的 EXPERIMENTS 数组（推荐）
+#   修改下面的 EXPERIMENTS 数组，然后直接运行: ./run_sweep.sh
+#
+# 用法2 — 命令行参数
 #   ./run_sweep.sh --datasets oxford_pets --param warmup_epochs --values 8,12
-#
-#   # 多参数网格
 #   ./run_sweep.sh --datasets oxford_pets --params warmup_epochs:8,12 teacher_temp:0.05,0.07
-#
-#   # 多数据集
-#   ./run_sweep.sh --datasets oxford_pets,cub --param warmup_epochs --values 8,12
 #
 # 短名 → YAML路径:
 #   warmup_epochs → stn_config.two_stage.warmup_epochs
@@ -27,6 +24,17 @@ set -e
 CONDA_PYTHON="/mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/anaconda3/envs/wca/bin/python"
 
 # ============================================================================
+# 实验计划（直接编辑生效，命令行参数会覆盖）
+# 格式: "dataset param_name values"
+# ============================================================================
+EXPERIMENTS=(
+    # 示例：测试三个数据集的 warmup_epochs
+    # "oxford_pets warmup_epochs 8,10,12,15"
+    # "cub         warmup_epochs 8,10,12,15"
+    # "dtd         warmup_epochs 8,10,12,15"
+)
+
+# ============================================================================
 # 参数映射
 # ============================================================================
 declare -A PARAM_MAP=(
@@ -41,12 +49,16 @@ declare -A PARAM_MAP=(
 )
 
 # ============================================================================
-# 构建实验计划
+# 构建实验计划（如果 EXPERIMENTS 数组为空，从命令行参数构建）
 # ============================================================================
 DATASETS=()
-EXPERIMENTS=()  # 每个元素: "dataset YAML_path val1,val2,val3"
 
-while [[ $# -gt 0 ]]; do
+if [[ ${#EXPERIMENTS[@]} -gt 0 ]]; then
+    # EXPERIMENTS 数组中已有数据，跳过 CLI 解析
+    :
+else
+    # 从 CLI 构建 EXPERIMENTS 数组
+    while [[ $# -gt 0 ]]; do
     case $1 in
         --datasets) IFS=',' read -ra DATASETS <<< "$2"; shift 2 ;;
         --dataset)  DATASETS=("$2"); shift 2 ;;
@@ -91,6 +103,8 @@ for combo in itertools.product(*[v.split(',') for v in val_lists]):
         *) shift ;;
     esac
 done
+
+fi  # end of CLI arg parsing block
 
 GPUS=${GPUS:-2}
 WORKERS=${WORKERS:-8}
