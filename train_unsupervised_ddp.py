@@ -336,7 +336,6 @@ def build_unsupervised_checkpoint_paths(dataset_name: str, config: dict) -> dict
         'dir': ckpt_dir,
         'base_model_name': base_model_name,
         'best': os.path.join(ckpt_dir, f"{base_model_name}_best.pth"),
-        'latest': os.path.join(ckpt_dir, f"{base_model_name}_latest.pth"),
     }
 
 
@@ -996,53 +995,13 @@ def main():
 
     # 只保存最佳验证集损失的模型和最新检查点
     ckpt_best_loss = ckpt_paths['best']
-    ckpt_latest = ckpt_paths['latest']
 
-    # 早停和最佳模型跟踪（只跟踪最佳损失）
+    # 早停和最佳模型跟踪
     best_val_loss = float('inf')
     best_loss_epoch = 0
     best_loss_acc = 0.0
     patience_counter = 0
     start_epoch = 0
-
-    # 断点续训
-    if os.path.exists(ckpt_latest):
-        if is_main_process():
-            print(f"\n🔄 发现检查点，尝试恢复训练: {ckpt_latest}")
-        
-        try:
-            checkpoint = torch.load(ckpt_latest, map_location=device)
-            
-            if hasattr(stn_model, 'module'):
-                stn_model.module.load_state_dict(checkpoint['model_state_dict'])
-            else:
-                stn_model.load_state_dict(checkpoint['model_state_dict'])
-            
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-            if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            
-            start_epoch = checkpoint['epoch'] + 1
-            best_val_loss = checkpoint.get('best_val_loss', float('inf'))
-            best_loss_acc = checkpoint.get('best_loss_acc', 0.0)
-            best_loss_epoch = checkpoint.get('best_loss_epoch', 0)
-            patience_counter = checkpoint.get('patience_counter', 0)
-            
-            if is_main_process():
-                print(f"✅ 成功恢复训练状态:")
-                print(f"   - 起始Epoch: {start_epoch}/{total_epochs}")
-                print(f"   - 最佳Loss: {best_val_loss:.6f} (Epoch {best_loss_epoch}, Acc={best_loss_acc:.3f})")
-                print(f"   - 早停计数: {patience_counter}/{patience}")
-        
-        except Exception as e:
-            if is_main_process():
-                print(f"⚠️ 恢复检查点失败: {e}")
-                print(f"   从头开始训练...")
-            start_epoch = 0
-    else:
-        if is_main_process():
-            print(f"\n🆕 未找到检查点，从头开始训练")
 
     if is_main_process():
         print(f"\n开始无监督分布式训练：")
@@ -1136,23 +1095,6 @@ def main():
                 patience_counter += 1
                 print(f"  ⏳ 验证损失未改善 {patience_counter}/{patience} 轮")
             
-            # 保存最新检查点（用于断点续训）
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': stn_model.module.state_dict() if hasattr(stn_model, 'module') else stn_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
-                'best_val_loss': best_val_loss,
-                'best_loss_acc': best_loss_acc,
-                'best_loss_epoch': best_loss_epoch,
-                'patience_counter': patience_counter,
-                'train_loss': train_loss,
-                'train_acc': train_acc,
-                'val_loss': val_loss,
-                'val_acc': val_acc,
-            }
-            torch.save(checkpoint, ckpt_latest)
-            print(f"  💾 已保存最新检查点: {ckpt_latest}")
 
             if patience_counter >= patience:
                 print("🛑 早停触发，结束训练")

@@ -511,8 +511,8 @@ class KLConsistencyLoss(nn.Module):
         self.fused_temperature = 0.05  # 融合特征温度（0.7倍CLIP标准温度）
         
         print(f"    🌡️  KL一致性损失温度配置（硬编码）:")
-        print(f"       - 局部视角温度: {self.view_temperature} (soft, 鼓励探索)")
-        print(f"       - 融合特征温度: {self.fused_temperature} (hard, 明确监督)")
+        // print(f"       - 局部视角温度: {self.view_temperature} (soft, 鼓励探索)")
+        // print(f"       - 融合特征温度: {self.fused_temperature} (hard, 明确监督)")
         
     def forward(self, view_features, text_features, fused_logits):
         """
