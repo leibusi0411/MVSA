@@ -499,31 +499,36 @@ def compute_two_stage_unsupervised_loss(criterion,
         loss_details['warmup_fused'] = float(warmup_fused.item())
         loss_details['warmup_fused_weighted'] = float((two_stage_cfg['warmup_fused_weight'] * warmup_fused).item())
     else:
-        # 阶段二（periodic）：使用周期性刷新的teacher分布监督局部视角
-        if periodic_target_probs is None:
-            # 容错回退：若未提供teacher目标，则退化为当前融合分布
-            target_from_teacher = F.softmax(
-                fused_logits_raw.detach() / max(two_stage_cfg['dec_target_temp'], 1e-6),
-                dim=-1
-            )
-        else:
-            target_from_teacher = periodic_target_probs.detach()
+        # 阶段二（symmetric）：fused ↔ local 互相作为目标
+        # Path 1: fused → local（fused 做 teacher，训 localization_network）
+        # Path 2: local → fused（local 共识做 teacher，训 fusion_module）
+        dec_student_temp = max(two_stage_cfg['dec_student_temp'], 1e-6)
 
+        fused_probs = F.softmax(
+            fused_logits_raw.detach() / dec_student_temp, dim=-1
+        )
         dec_local = _multi_view_kl_from_logits(
             view_logits=view_logits_raw,
-            target_probs=target_from_teacher,
-            student_temp=two_stage_cfg['dec_student_temp']
+            target_probs=fused_probs,
+            student_temp=dec_student_temp
         )
-        stage2_kl_weight = float(getattr(criterion, 'kl_consistency_weight', 1.0))
-        weighted_dec_local = stage2_kl_weight * dec_local
 
-        stage_loss = weighted_dec_local
-        loss_details['phase'] = 'dec_periodic'
-        loss_details['dec_local_active'] = float(weighted_dec_local.item())
+        local_mean_logits = view_logits_raw.mean(dim=1)
+        local_mean_probs = F.softmax(
+            local_mean_logits.detach() / dec_student_temp, dim=-1
+        )
+        dec_fused = _kl_from_logits(
+            student_logits=fused_logits_raw,
+            target_probs=local_mean_probs,
+            student_temp=dec_student_temp
+        )
+
+        stage_loss = dec_local + dec_fused
+        loss_details['phase'] = 'dec_symmetric'
         loss_details['dec_local'] = float(dec_local.item())
-        loss_details['dec_local_weighted'] = float(weighted_dec_local.item())
-        loss_details['dec_fused'] = 0.0
-        loss_details['dec_fused_weighted'] = 0.0
+        loss_details['dec_local_weighted'] = float(dec_local.item())
+        loss_details['dec_fused'] = float(dec_fused.item())
+        loss_details['dec_fused_weighted'] = float(dec_fused.item())
 
     # === 兼容已有正则项（可选）===
     reg_total = torch.tensor(0.0, device=fused_logits_raw.device, dtype=fused_logits_raw.dtype)
