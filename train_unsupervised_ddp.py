@@ -303,13 +303,12 @@ def build_unsupervised_model_name(dataset_name: str, config: dict) -> str:
         f"_dim{stn_cfg.get('hidden_dim', 512)}"
     )
 
-    stage2_kl_weight = float(stn_cfg.get('kl_consistency_weight', 1.0))
     loss_suffix = (
         f"twostage_w{two_stage_cfg['warmup_epochs']}"
-        f"_mperiodic_u{two_stage_cfg['target_update_interval_epochs']}"
+        f"_symmetric"
         f"_tg{two_stage_cfg['teacher_temp']:.3f}"
-        f"_td{two_stage_cfg['dec_target_temp']:.3f}"
-        f"_kl{stage2_kl_weight:.2f}"
+        f"_ts{two_stage_cfg['warmup_student_temp']:.3f}"
+        f"_ds{two_stage_cfg['dec_student_temp']:.3f}"
     )
 
     if stn_cfg.get('fairness_weight', 0.0) > 0:
