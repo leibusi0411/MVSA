@@ -41,18 +41,15 @@ stn_config:
   # 阶段二（periodic）: 每隔若干epoch刷新一次融合teacher分布，期间固定目标监督局部视角
   two_stage:
     warmup_epochs: 8             # 阶段一持续的epoch数（细粒度任务可适当更长）
-    target_update_interval_epochs: 3  # 目标分布刷新周期，单位=epoch
 
-    # 阶段一参数（Global teacher指导Local与Fused）
-    teacher_temp: 0.07           # 全局teacher分布温度（越小越尖锐）
-    warmup_student_temp: 0.07    # warmup阶段student温度（作用于local/fused分布）
-    warmup_local_weight: 1.0     # KL(Global->Local)权重
-    warmup_fused_weight: 1.0     # KL(Global->Fused)权重
+    # 阶段一参数（冻结CLIP teacher → Local + Fused）
+    teacher_temp: 0.07           # 冻结CLIP teacher目标分布温度
+    warmup_student_temp: 0.07    # 阶段一student分布温度
+    warmup_local_weight: 1.0     # KL(CLIP → Local)权重
+    warmup_fused_weight: 1.0     # KL(CLIP → Fused)权重
 
-    # 阶段二参数（周期目标分布）
-    dec_target_temp: 0.07        # 目标分布温度（teacher端，越小越尖锐）
-    dec_student_temp: 0.15       # student端温度（越大越平滑）
-    # 阶段二KL损失权重统一使用 stn_config.kl_consistency_weight
+    # 阶段二参数（fused ↔ local 对称一致性）
+    dec_student_temp: 0.15       # 两个KL共享的温度参数
 
 # === 训练配置 ===
 training:
