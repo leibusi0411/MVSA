@@ -26,15 +26,15 @@ stn_config:
 
   # === 无监督损失权重配置 ===
   fairness_weight: 0.0           # 公平性正则化（centering 已够，禁用）
-  decorrelation_weight: 0.1      # 特征去相关损失（鼓励视角多样性）
+  decorrelation_weight: 0.0      # 特征去相关损失（鼓励视角多样性）
 
   # === 两阶段无监督训练配置 ===
   two_stage:
     warmup_epochs: 8             # 阶段一持续的epoch数（细粒度任务可适当更长）
 
     # 阶段一参数（冻结CLIP teacher → Local + Fused）
-    teacher_temp: 0.07           # 冻结CLIP teacher目标分布温度
-    warmup_student_temp: 0.07    # 阶段一student分布温度
+    teacher_temp: 0.05   # CLIP教师温度 尖锐一点好           # 冻结CLIP teacher目标分布温度
+    warmup_student_temp: 0.09   # 学生温度 比教师软    # 阶段一student分布温度
     warmup_local_weight: 1.0     # KL(CLIP → Local)权重
     warmup_fused_weight: 1.0     # KL(CLIP → Fused)权重
 

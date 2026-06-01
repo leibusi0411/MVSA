@@ -22,13 +22,14 @@ stn_config:
   logits_temp: 0.07
 
   fairness_weight: 0.0
-  decorrelation_weight: 0.1
+  decorrelation_weight: 0.0
 
   two_stage:
     warmup_epochs: 8
 
-    teacher_temp: 0.07
-    warmup_student_temp: 0.07
+    teacher_temp: 0.05   #CLIP教师温度参数  尖锐一点好   教师比学生尖锐一点
+    warmup_student_temp: 0.09   # local 和 fused 共用  学生温度参数
+    #第一阶段两个损失权重权重 
     warmup_local_weight: 1.0
     warmup_fused_weight: 1.0
 
