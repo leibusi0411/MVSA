@@ -690,8 +690,9 @@ def unsupervised_train_one_epoch(model: DDP,
             if loss_details.get('phase') == 'warmup':
                 progress_dict['WLoc'] = f"{loss_details.get('warmup_local', 0.0):.3f}/{loss_details.get('warmup_local_weighted', 0.0):.3f}"
                 progress_dict['WFus'] = f"{loss_details.get('warmup_fused', 0.0):.3f}/{loss_details.get('warmup_fused_weighted', 0.0):.3f}"
-            elif loss_details.get('phase') == 'dec_periodic':
-                progress_dict['DecP'] = f"{loss_details.get('dec_local', 0.0):.3f}/{loss_details.get('dec_local_active', 0.0):.3f}"
+            elif loss_details.get('phase') == 'dec_symmetric':
+                progress_dict['Loc'] = f"{loss_details.get('dec_local', 0.0):.3f}"
+                progress_dict['Fus'] = f"{loss_details.get('dec_fused', 0.0):.3f}"
 
             # 显示正则项损失分量
             if getattr(criterion, 'classification_weight', 0.0) > 0:
@@ -806,7 +807,8 @@ def unsupervised_validate(model: DDP,
                     progress_dict['wloc'] = f"{loss_details.get('warmup_local', 0.0):.3f}/{loss_details.get('warmup_local_weighted', 0.0):.3f}"
                     progress_dict['wfus'] = f"{loss_details.get('warmup_fused', 0.0):.3f}/{loss_details.get('warmup_fused_weighted', 0.0):.3f}"
                 else:
-                    progress_dict['decp'] = f"{loss_details.get('dec_local', 0.0):.3f}/{loss_details.get('dec_local_weighted', 0.0):.3f}"
+                    progress_dict['loc'] = f"{loss_details.get('dec_local', 0.0):.3f}"
+                    progress_dict['fus'] = f"{loss_details.get('dec_fused', 0.0):.3f}"
                 if getattr(criterion, 'classification_weight', 0.0) > 0:
                     progress_dict['cls'] = f"{loss_details.get('classification', 0.0):.3f}/{loss_details.get('classification_weighted', 0.0):.3f}"
                 if getattr(criterion, 'fairness_weight', 0.0) > 0:
