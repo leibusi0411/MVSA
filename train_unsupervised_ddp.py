@@ -281,17 +281,13 @@ def get_two_stage_config(config: dict) -> dict:
     )
 
     return {
-        # 阶段切换
         'warmup_epochs': max(0, warmup_epochs),
-        'target_update_interval_epochs': target_update_interval_epochs,
-        # 阶段一：Global -> (Local, Fused)
         'teacher_temp': float(two_stage.get('teacher_temp', base_temp)),
         'warmup_student_temp': float(two_stage.get('warmup_student_temp', base_temp)),
         'warmup_local_weight': float(two_stage.get('warmup_local_weight', 1.0)),
         'warmup_fused_weight': float(two_stage.get('warmup_fused_weight', 1.0)),
-        # 阶段二：periodic target update
-        'dec_target_temp': float(two_stage.get('dec_target_temp', 0.05)),
         'dec_student_temp': float(two_stage.get('dec_student_temp', 0.1)),
+        'centering_momentum': float(two_stage.get('centering_momentum', 0.9)),
     }
 
 
@@ -383,6 +379,22 @@ def compute_global_logits(model_without_ddp,
     return global_logits_raw
 
 
+def init_centering_buffer(num_classes: int, device: torch.device) -> torch.Tensor:
+    """初始化中心向量为零，shape [num_classes]"""
+    return torch.zeros(num_classes, device=device)
+
+
+def update_centering_buffer(c: torch.Tensor, batch_logits: torch.Tensor,
+                            momentum: float) -> torch.Tensor:
+    """EMA 更新中心向量。batch_logits: [B, num_classes]，对 batch 维度求平均"""
+    with torch.no_grad():
+        batch_mean = batch_logits.mean(dim=0)
+        if is_dist_avail_and_initialized():
+            dist.all_reduce(batch_mean, op=dist.ReduceOp.AVG)
+        c.data.mul_(momentum).add_(batch_mean, alpha=1.0 - momentum)
+    return c
+
+
 def compute_two_stage_unsupervised_loss(criterion,
                                         fused_features: torch.Tensor,
                                         view_features: torch.Tensor,
@@ -391,7 +403,8 @@ def compute_two_stage_unsupervised_loss(criterion,
                                         global_logits_raw: torch.Tensor,
                                         epoch: int,
                                         global_step: int,
-                                        config: dict):
+                                        config: dict,
+                                        center_c: torch.Tensor | None = None):
     """
     两阶段无监督目标：
     - 阶段一（warmup）：Global -> Local + Global -> Fused
@@ -463,23 +476,26 @@ def compute_two_stage_unsupervised_loss(criterion,
         loss_details['warmup_fused_weighted'] = float((two_stage_cfg['warmup_fused_weight'] * warmup_fused).item())
     else:
         # 阶段二（symmetric）：fused ↔ local 互相作为目标
-        # Path 1: fused → local（fused 做 teacher，训 localization_network）
-        # Path 2: local → fused（local 共识做 teacher，训 fusion_module）
+        # 对做 teacher 的一侧减去中心向量 c 再 softmax，防止分布坍缩
         dec_student_temp = max(two_stage_cfg['dec_student_temp'], 1e-6)
 
-        fused_probs = F.softmax(
-            fused_logits_raw.detach() / dec_student_temp, dim=-1
-        )
+        if center_c is not None:
+            fused_centered = fused_logits_raw.detach() - center_c.unsqueeze(0)
+            local_mean_logits = view_logits_raw.mean(dim=1)
+            local_centered = local_mean_logits.detach() - center_c.unsqueeze(0)
+        else:
+            fused_centered = fused_logits_raw.detach()
+            local_mean_logits = view_logits_raw.mean(dim=1)
+            local_centered = local_mean_logits.detach()
+
+        fused_probs = F.softmax(fused_centered / dec_student_temp, dim=-1)
         dec_local = _multi_view_kl_from_logits(
             view_logits=view_logits_raw,
             target_probs=fused_probs,
             student_temp=dec_student_temp
         )
 
-        local_mean_logits = view_logits_raw.mean(dim=1)
-        local_mean_probs = F.softmax(
-            local_mean_logits.detach() / dec_student_temp, dim=-1
-        )
+        local_mean_probs = F.softmax(local_centered / dec_student_temp, dim=-1)
         dec_fused = _kl_from_logits(
             student_logits=fused_logits_raw,
             target_probs=local_mean_probs,
@@ -544,10 +560,11 @@ def unsupervised_train_one_epoch(model: DDP,
                                  device: torch.device,
                                  epoch: int,
                                  config: dict,
-                                 text_features: torch.Tensor):
+                                 text_features: torch.Tensor,
+                                 center_c: torch.Tensor | None = None):
     """
     无监督训练一个epoch
-    
+
     注意：不使用标签信息，labels仅用于计算准确率（监控用）
     """
     model.train()
@@ -557,6 +574,7 @@ def unsupervised_train_one_epoch(model: DDP,
 
     temperature = float(config['stn_config'].get('logits_temp', 0.07))
     two_stage_cfg = get_two_stage_config(config)
+    centering_momentum = two_stage_cfg.get('centering_momentum', 0.9)
 
     # 梯度裁剪配置
     max_grad_norm = float(config['training'].get('max_grad_norm', 1.0))
@@ -593,7 +611,12 @@ def unsupervised_train_one_epoch(model: DDP,
             epoch=epoch,
             global_step=global_step,
             config=config,
+            center_c=center_c,
         )
+
+        # 更新中心向量（阶段二用 fused_logits 更新）
+        if epoch >= two_stage_cfg['warmup_epochs'] and center_c is not None:
+            update_centering_buffer(center_c, fused_logits_raw, centering_momentum)
 
         # 仅用于监控准确率
         logits_for_acc = fused_logits_raw / temperature
@@ -683,7 +706,8 @@ def unsupervised_validate(model: DDP,
                           device: torch.device,
                           epoch: int,
                           config: dict,
-                          text_features: torch.Tensor):
+                          text_features: torch.Tensor,
+                          center_c: torch.Tensor | None = None):
     """无监督验证"""
     model.eval()
 
@@ -721,6 +745,7 @@ def unsupervised_validate(model: DDP,
                 epoch=epoch,
                 global_step=global_step,
                 config=config,
+                center_c=center_c,
             )
 
             similarity = fused_logits_raw / temperature
@@ -939,6 +964,11 @@ def main():
     patience_counter = 0
     start_epoch = 0
 
+    # 中心向量（防坍缩）
+    num_classes = all_classes_text_features.shape[1]
+    center_c = init_centering_buffer(num_classes, device)
+    centering_momentum = two_stage_cfg.get('centering_momentum', 0.9)
+
     # 断点续训
     if os.path.exists(ckpt_latest):
         if is_main_process():
@@ -999,4 +1029,29 @@ def main():
     # 训练循环
     for epoch in range(start_epoch, total_epochs):
         model_without_ddp = stn_model.module if hasattr(stn_model, 'module') else stn_model
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        train_loss, train_acc = unsupervised_train_one_epoch(
+            model=stn_model,
+            optimizer=optimizer,
+            criterion=criterion,
+            train_loader=train_loader,
+            device=device,
+            epoch=epoch,
+            config=config,
+            text_features=all_classes_text_features,
+            center_c=center_c,
+        )
+
+        val_loss, val_acc = unsupervised_validate(
+            model=stn_model,
+            criterion=criterion,
+            val_loader=val_loader,
+            device=device,
+            epoch=epoch,
+            config=config,
+            text_features=all_classes_text_features,
+            center_c=center_c,
+        )
 
