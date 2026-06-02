@@ -540,8 +540,6 @@ def compute_two_stage_unsupervised_loss(criterion,
         loss_details['dec_fused_weighted'] = float(dec_fused.item())
         loss_details['clip_guidance'] = float(clip_guidance.item())
         loss_details['clip_guidance_weighted'] = float(weighted_clip_guidance.item())
-        loss_details['dec_fused'] = 0.0
-        loss_details['dec_fused_weighted'] = 0.0
 
     # === 兼容已有正则项（可选）===
     reg_total = torch.tensor(0.0, device=fused_logits_raw.device, dtype=fused_logits_raw.dtype)
