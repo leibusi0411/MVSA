@@ -292,6 +292,7 @@ def get_two_stage_config(config: dict) -> dict:
         # 阶段二：periodic target update
         'dec_target_temp': float(two_stage.get('dec_target_temp', 0.05)),
         'dec_student_temp': float(two_stage.get('dec_student_temp', 0.1)),
+        'clip_guidance_weight': float(two_stage.get('clip_guidance_weight', 1.0)),
     }
 
 
@@ -522,12 +523,23 @@ def compute_two_stage_unsupervised_loss(criterion,
             student_temp=dec_student_temp
         )
 
-        stage_loss = dec_local + dec_fused
+        # 弱 CLIP 约束：防止 fused↔local 闭环坍缩
+        clip_guidance = _kl_from_logits(
+            student_logits=fused_logits_raw,
+            target_probs=F.softmax(global_logits_raw.detach() / max(two_stage_cfg['teacher_temp'], 1e-6), dim=-1),
+            student_temp=two_stage_cfg['warmup_student_temp']
+        )
+        clip_guidance_weight = two_stage_cfg.get('clip_guidance_weight', 1.0)
+        weighted_clip_guidance = clip_guidance_weight * clip_guidance
+
+        stage_loss = dec_local + dec_fused + weighted_clip_guidance
         loss_details['phase'] = 'dec_symmetric'
         loss_details['dec_local'] = float(dec_local.item())
         loss_details['dec_local_weighted'] = float(dec_local.item())
         loss_details['dec_fused'] = float(dec_fused.item())
         loss_details['dec_fused_weighted'] = float(dec_fused.item())
+        loss_details['clip_guidance'] = float(clip_guidance.item())
+        loss_details['clip_guidance_weighted'] = float(weighted_clip_guidance.item())
         loss_details['dec_fused'] = 0.0
         loss_details['dec_fused_weighted'] = 0.0
 

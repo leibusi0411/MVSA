@@ -34,6 +34,7 @@ stn_config:
     warmup_fused_weight: 1.0
 
     dec_student_temp: 0.15
+    clip_guidance_weight: 1.0   # 阶段二 CLIP 约束权重 防止坍缩
     centering_momentum: 0.9   # teacher logits softmax前减去中心向量
 
 # === 训练配置 ===
