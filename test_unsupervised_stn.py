@@ -1,20 +1,24 @@
 """
 无监督多视角STN模型测试脚本
 
-基于 test_multi_stn.py 改造：
-1. 使用 UN-STN-Config/{dataset}.yaml 自动匹配无监督配置
-2. 加载 checkpoints/unsupervised/{dataset}/ 下的无监督模型
-3. 保留 STN 多视角可视化能力
-4. 只测试 best 模型（自动按配置构建路径）
+功能：
+1. 自动匹配 UN-STN-Config 配置和 checkpoints/unsupervised 下的模型
+2. 支持 --ckpt_path 直接指定检查点文件
+3. 支持 --list 列出可用检查点
+4. 保留 STN 多视角可视化能力
 
-使用命令示例：
+使用示例：
+  # 自动匹配最佳模型
+  python test_unsupervised_stn.py --dataset_name oxford_pets
 
-# 1) 测试默认best模型（推荐）
-python test_unsupervised_stn.py --dataset_name oxford_pets
+  # 指定检查点文件
+  python test_unsupervised_stn.py --dataset_name oxford_pets --ckpt_path checkpoints/unsupervised/oxford_pets/xxx_best.pth
 
-# 2) 控制可视化输出：前3个batch可视化，每个batch最多保存8张
-python test_unsupervised_stn.py --dataset_name oxford_pets --visual_batches 3 --max_vis_samples 8
+  # 列出可用检查点
+  python test_unsupervised_stn.py --dataset_name oxford_pets --list
 
+  # 控制可视化输出
+  python test_unsupervised_stn.py --dataset_name oxford_pets --visual_batches 3 --max_vis_samples 8
 """
 
 import argparse
@@ -22,6 +26,7 @@ import os
 import random
 import traceback
 from glob import glob
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -38,43 +43,35 @@ from train_unsupervised_ddp import build_unsupervised_checkpoint_paths
 
 
 def accuracy(output, target, n, dataset_name):
-    """计算Top-1准确率（兼容ImageNet-A/R子集映射）"""
+    """计算Top-1准确率"""
     if dataset_name in ['imagenet-a', 'imageneta']:
         _, pred = output[:, imagenet_a_lt].max(1)
     elif dataset_name in ['imagenet-r', 'imagenetr']:
         _, pred = output[:, imagenet_r_lt].max(1)
     else:
         _, pred = output.max(1)
-
     correct = pred.eq(target)
     return float(correct.float().sum().cpu().numpy()) / n * 100
 
 
 def visualize_preprocessed_vs_stn(preprocessed_images, transformed_images, dataset_name,
-                                  config=None,
-                                  save_dir="visualizations/test_unsupervised_stn_transforms",
-                                  batch_idx=0, max_samples=None,
-                                  theta_matrices=None, position_params=None):
+                                   config=None,
+                                   save_dir="visualizations/test_unsupervised_stn_transforms",
+                                   batch_idx=0, max_samples=None,
+                                   theta_matrices=None, position_params=None):
     """可视化输入图与STN多视角输出"""
     if config is not None:
         stn_config = config.get('stn_config', {})
-        model_size = config.get('model_size', 'ViT-B_32')
-
+        model_size = config.get('model_size', 'ViT-B/32')
         num_views = stn_config.get('num_views', 4)
         fusion_mode = stn_config.get('fusion_mode', 'concat')
         hidden_dim = stn_config.get('hidden_dim', 256)
-        kl_weight = stn_config.get('kl_consistency_weight', 0.0)
-        fair_weight = stn_config.get('fairness_weight', 0.0)
-        dec_weight = stn_config.get('decorrelation_weight', 0.0)
 
         config_parts = [
             f"model_{model_size.replace('/', '_')}",
             f"views{num_views}",
             f"{fusion_mode}",
             f"dim{hidden_dim}",
-            f"kl{kl_weight}",
-            f"fair{fair_weight}",
-            f"dec{dec_weight}",
         ]
         dataset_save_dir = os.path.join(save_dir, dataset_name, "_".join(config_parts))
     else:
@@ -85,9 +82,9 @@ def visualize_preprocessed_vs_stn(preprocessed_images, transformed_images, datas
     batch_size = preprocessed_images.size(0) if max_samples is None else min(preprocessed_images.size(0), max_samples)
     num_views = transformed_images.size(1)
 
-    def denormalize(tensor, mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711]):
-        mean = torch.tensor(mean).view(3, 1, 1).to(tensor.device)
-        std = torch.tensor(std).view(3, 1, 1).to(tensor.device)
+    def denormalize(tensor):
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1).to(tensor.device)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1).to(tensor.device)
         return tensor * std + mean
 
     def tensor_to_pil(tensor):
@@ -100,14 +97,14 @@ def visualize_preprocessed_vs_stn(preprocessed_images, transformed_images, datas
 
         preprocessed_denorm = denormalize(preprocessed_images[i])
         axes[0].imshow(tensor_to_pil(preprocessed_denorm))
-        axes[0].set_title('Input_image 448x448', fontsize=10)
+        axes[0].set_title('Input 448x448', fontsize=10)
         axes[0].axis('off')
 
         for view_idx in range(num_views):
             transformed_denorm = denormalize(transformed_images[i, view_idx])
             axes[1 + view_idx].imshow(tensor_to_pil(transformed_denorm))
 
-            title = f'STN View {view_idx + 1} 224x224'
+            title = f'View {view_idx + 1} 224x224'
             if position_params is not None:
                 param_x = position_params[i, view_idx * 2].item()
                 param_y = position_params[i, view_idx * 2 + 1].item()
@@ -117,12 +114,6 @@ def visualize_preprocessed_vs_stn(preprocessed_images, transformed_images, datas
             axes[1 + view_idx].axis('off')
 
         plt.tight_layout()
-
-        if theta_matrices is not None:
-            fig.text(0.5, 0.02,
-                     f'Sample {i}: Transformation matrices show scale and translation parameters',
-                     ha='center', fontsize=8, style='italic')
-
         save_path = os.path.join(dataset_save_dir, f'batch{batch_idx}_sample{i:03d}.png')
         plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
@@ -131,24 +122,22 @@ def visualize_preprocessed_vs_stn(preprocessed_images, transformed_images, datas
 def stn_precise_testing(stn_model, dataloader, device, dataset_name,
                        precomputed_text_features, config=None, model_tag=None,
                        visual_batches=10, max_samples=None):
-    """无监督模型测试（始终使用可视化模式提取特征）。"""
+    """无监督模型测试"""
     stn_model.eval()
     all_image_features = []
     all_targets = []
 
     with torch.no_grad():
-        for batch_idx, (images_448, labels) in enumerate(tqdm(dataloader, desc="STN特征提取")):
+        for batch_idx, (images_448, labels) in enumerate(tqdm(dataloader, desc="Testing")):
             images_448 = images_448.to(device, non_blocking=True).float()
             labels = labels.to(device, non_blocking=True).long()
 
-            # 始终使用test模式，统一走可视化分支（同时返回特征与可视化数据）
             result = stn_model(images_448, mode='test')
             if not (isinstance(result, tuple) and len(result) == 2):
                 raise RuntimeError("stn_model(mode='test') 需要返回 (batch_features, vis_data)")
 
             batch_features, vis_data = result
 
-            # 仅控制保存可视化图片的数量，不改变特征提取流程
             if batch_idx < visual_batches:
                 try:
                     save_base = "visualizations/test_unsupervised_stn_transforms"
@@ -167,7 +156,7 @@ def stn_precise_testing(stn_model, dataloader, device, dataset_name,
                         position_params=vis_data.get('position_params', None)
                     )
                 except Exception as vis_e:
-                    print(f"⚠️ 可视化失败，继续测试: {vis_e}")
+                    print(f"  Visualization failed: {vis_e}")
 
             all_image_features.append(batch_features)
             all_targets.append(labels)
@@ -178,12 +167,12 @@ def stn_precise_testing(stn_model, dataloader, device, dataset_name,
 
     logits = all_image_features @ precomputed_text_features
     stn_acc = accuracy(logits, all_targets, total_samples, dataset_name)
-    print(f"✅ STN测试完成，共测试 {total_samples} 张图片，Top-1 Acc: {stn_acc:.2f}%")
+    print(f"  Tested {total_samples} samples, Top-1 Acc: {stn_acc:.2f}%")
     return stn_acc
 
 
 def load_state_dict_flexible(stn_model, ckpt_path, device):
-    """兼容 best(纯state_dict) 与 latest(包含model_state_dict的checkpoint)"""
+    """兼容 best(pure state_dict) 与 latest(含 model_state_dict 的 checkpoint)"""
     obj = torch.load(ckpt_path, map_location=device)
     if isinstance(obj, dict) and 'model_state_dict' in obj:
         state_dict = obj['model_state_dict']
@@ -192,59 +181,71 @@ def load_state_dict_flexible(stn_model, ckpt_path, device):
     stn_model.load_state_dict(state_dict, strict=True)
 
 
-def resolve_unstn_config_path(dataset_name, config_dir='UN-STN-Config'):
-    """
-    自动解析UN-STN-Config配置路径：
-    1) 优先使用 UN-STN-Config/{dataset_name}.yaml
-    2) 若不存在，则扫描目录并按yaml内 dataset 字段匹配
-    """
+def resolve_config_path(dataset_name, config_dir='UN-STN-Config'):
+    """自动解析配置文件路径"""
     exact_path = os.path.join(config_dir, f"{dataset_name}.yaml")
     if os.path.exists(exact_path):
         return exact_path
 
     yaml_files = sorted(glob(os.path.join(config_dir, '*.yaml')))
-    matched = []
     for ypath in yaml_files:
         try:
             with open(ypath, 'r', encoding='utf-8') as f:
-                ycfg = yaml.load(f, Loader=yaml.FullLoader)
-            y_dataset = (ycfg or {}).get('dataset', None)
-            if y_dataset == dataset_name:
-                matched.append(ypath)
+                ycfg = yaml.safe_load(f)
+            if (ycfg or {}).get('dataset') == dataset_name:
+                return ypath
         except Exception:
             continue
 
-    if len(matched) == 1:
-        return matched[0]
-    if len(matched) > 1:
-        raise RuntimeError(f"检测到多个匹配数据集'{dataset_name}'的配置文件，请保留唯一配置: {matched}")
+    raise FileNotFoundError(f"未找到数据集 '{dataset_name}' 的配置文件")
 
-    raise FileNotFoundError(
-        f"未找到数据集 '{dataset_name}' 对应的UN-STN配置。"
-        f"请确认存在 {config_dir}/{dataset_name}.yaml。"
+
+def find_checkpoints(ckpt_dir):
+    """返回目录下所有 best.pth 文件，按修改时间降序"""
+    files = sorted(
+        glob(os.path.join(ckpt_dir, '*_best.pth')),
+        key=os.path.getmtime,
+        reverse=True
     )
+    return files
+
+
+def extract_ckpt_info(ckpt_path, config):
+    """从检查点文件名和配置中提取关键参数信息"""
+    name = os.path.basename(ckpt_path)
+    info = {}
+    # 提取 warmup_epochs
+    import re
+    m = re.search(r'twostage_w(\d+)_', name)
+    if m:
+        info['warmup_epochs'] = int(m.group(1))
+    m = re.search(r'_kl([\d.]+)_', name)
+    if m:
+        info['kl_weight'] = float(m.group(1))
+    m = re.search(r'_td([\d.]+)_', name)
+    if m:
+        info['dec_target_temp'] = float(m.group(1))
+    return info
 
 
 def main():
-    parser = argparse.ArgumentParser(description='无监督多视角STN模型测试系统')
+    parser = argparse.ArgumentParser(description='无监督多视角STN模型测试')
     parser.add_argument('--dataset_name', type=str, default='oxford_pets',
-                        choices=['cub', 'imagenet', 'food101', 'oxford_pets', 'dtd',
-                                 'fgvc-aircraft', 'stanford_cars', 'stanford_dogs', 'flowers102',
-                                 'eurosat', 'places365', 'sun397',
-                                 'imagenetv2', 'imagenet-v2', 'imagenet-r', 'imagenetr',
-                                 'imagenet-s', 'imagenets', 'imagenet-sketch',
-                                 'imagenet-a', 'imageneta'],
                         help='数据集名称')
-    parser.add_argument('--batch_size', type=int, default=32, help='测试批次大小')
-    parser.add_argument('--num_workers', type=int, default=4, help='数据加载线程数')
-    parser.add_argument('--device', type=str, default=None, help='计算设备(cuda/cpu)')
-    parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--ckpt_path', type=str, default=None,
                         help='直接指定检查点文件路径（优先级最高）')
-    parser.add_argument('--visual_batches', type=int, default=10,
-                        help='前N个batch保存可视化图片，0表示不保存')
-    parser.add_argument('--max_vis_samples', type=int, default=0,
-                        help='每个可视化batch最多保存样本数；0表示保存整个batch')
+    parser.add_argument('--list', action='store_true',
+                        help='列出可用检查点，不运行测试')
+    parser.add_argument('--batch_size', type=int, default=32, help='测试批次大小')
+    parser.add_argument('--num_workers', type=int, default=8, help='数据加载线程数')
+    parser.add_argument('--device', type=str, default=None, help='计算设备')
+    parser.add_argument('--seed', type=int, default=42, help='随机种子')
+    parser.add_argument('--visual_batches', type=int, default=3,
+                        help='前N个batch保存可视化')
+    parser.add_argument('--max_vis_samples', type=int, default=8,
+                        help='每个batch最多保存样本数，0=全部')
+    parser.add_argument('--all', action='store_true',
+                        help='测试目录下所有best检查点')
     args = parser.parse_args()
 
     if args.device is None:
@@ -259,39 +260,83 @@ def main():
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    print("=== 无监督多视角STN模型测试系统 ===")
-    print(f"数据集: {args.dataset_name}")
-    print(f"设备: {args.device}")
-    print(f"批次大小: {args.batch_size}")
+    print("=" * 50)
+    print("  无监督多视角STN模型测试")
+    print("=" * 50)
+    print(f"数据集:   {args.dataset_name}")
+    print(f"设备:     {args.device}")
 
     try:
-        config_path = resolve_unstn_config_path(
-            dataset_name=args.dataset_name,
-            config_dir='UN-STN-Config'
-        )
-
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
-
+        # 加载配置
+        config_path = resolve_config_path(args.dataset_name)
         with open(config_path, 'r', encoding='utf-8') as f:
-            config = yaml.load(f, Loader=yaml.FullLoader)
+            config = yaml.safe_load(f)
 
         model_size = config['model_size']
         stn_config = config['stn_config']
         data_path = config['data_path']
         config_dataset = config.get('dataset', args.dataset_name)
 
-        print(f"✅ 已加载配置: {config_path}")
-        print(f"🗂️ 配置数据集: {config_dataset}")
-        print(f"🤖 CLIP模型: {model_size}")
-        print(f"🧩 STN参数: views={stn_config.get('num_views', 4)}, fusion={stn_config.get('fusion_mode', 'simple')}, dim={stn_config.get('hidden_dim', 512)}")
+        print(f"配置:     {config_path}")
+        print(f"CLIP:     {model_size}")
+        print(f"STN:      views={stn_config.get('num_views', 4)}, "
+              f"fusion={stn_config.get('fusion_mode', 'simple')}, "
+              f"dim={stn_config.get('hidden_dim', 512)}")
 
+        # 检查点目录
+        ckpt_dir = os.path.join('checkpoints', 'unsupervised', config_dataset)
+        if not os.path.isdir(ckpt_dir):
+            raise FileNotFoundError(f"检查点目录不存在: {ckpt_dir}")
+
+        # --list 模式
+        if args.list:
+            print(f"\n检查点目录: {ckpt_dir}/")
+            all_ckpts = find_checkpoints(ckpt_dir)
+            if not all_ckpts:
+                print("  (无检查点文件)")
+            else:
+                for i, p in enumerate(all_ckpts):
+                    info = extract_ckpt_info(p, config)
+                    mtime = os.path.getmtime(p)
+                    from datetime import datetime
+                    dt = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+                    size_mb = os.path.getsize(p) / 1024 / 1024
+                    extra = ', '.join(f'{k}={v}' for k, v in info.items())
+                    print(f"  [{i+1}] {os.path.basename(p)}")
+                    print(f"       {dt}, {size_mb:.0f}MB, {extra}")
+            return
+
+        # 确定要测试的检查点
+        if args.ckpt_path:
+            ckpt_list = [args.ckpt_path]
+            if not os.path.exists(args.ckpt_path):
+                raise FileNotFoundError(f"检查点不存在: {args.ckpt_path}")
+        elif args.all:
+            ckpt_list = find_checkpoints(ckpt_dir)
+            if not ckpt_list:
+                raise FileNotFoundError(f"目录下无检查点: {ckpt_dir}")
+            print(f"\n扫描到 {len(ckpt_list)} 个检查点")
+        else:
+            ckpt_paths = build_unsupervised_checkpoint_paths(config_dataset, config)
+            config_ckpt = ckpt_paths['best']
+            if not os.path.exists(config_ckpt):
+                raise FileNotFoundError(
+                    f"配置文件构造的检查点不存在:\n"
+                    f"  {config_ckpt}\n"
+                    f"用 --ckpt_path 直接指定路径，或 --all 扫描目录下所有检查点"
+                )
+            ckpt_list = [config_ckpt]
+            print(f"\n配置匹配: {os.path.basename(config_ckpt)}")
+
+        # 加载模型
+        print(f"\n加载 CLIP: {model_size}")
         clip_model, _ = clip.load(model_size, device=args.device)
         clip_model = clip_model.float()
 
         num_views = stn_config.get('num_views', 4)
         stn_model = MultiViewSTNModel(clip_model, stn_config, num_views=num_views).to(args.device).float()
 
+        # 加载数据
         test_dataloader = load_multi_view_dataset(
             dataset_name=config_dataset,
             data_path=data_path,
@@ -305,45 +350,56 @@ def main():
             persistent_workers=False,
         )
 
+        # 加载文本特征
         model_name = model_size.replace('/', '_')
         text_features_path = f"text_features/{config_dataset}_{model_name}.pt"
         if not os.path.exists(text_features_path):
-            raise FileNotFoundError(f"未找到文本特征文件: {text_features_path}")
-
-        precomputed_text_features = torch.load(text_features_path, map_location=args.device).float().to(args.device)
-
-        # 检查点路径：优先使用 --ckpt_path，否则从配置构造
-        ckpt_tag = 'best'
-        if args.ckpt_path:
-            ckpt_path = args.ckpt_path
-        else:
-            ckpt_path = build_unsupervised_checkpoint_paths(config_dataset, config)['best']
+            raise FileNotFoundError(f"文本特征不存在: {text_features_path}")
+        text_features = torch.load(text_features_path, map_location=args.device).float().to(args.device)
 
         max_samples = None if args.max_vis_samples == 0 else args.max_vis_samples
+        results = []
 
-        if not os.path.exists(ckpt_path):
-            raise FileNotFoundError(f"模型文件不存在: {ckpt_path}")
+        # 遍历测试所有检查点
+        for ckpt_path in ckpt_list:
+            ckpt_name = os.path.basename(ckpt_path)
+            info = extract_ckpt_info(ckpt_path, config)
+            tag = '_'.join(f'{k}{v}' for k, v in info.items()) if info else 'best'
 
-        print(f"\n📥 加载模型({ckpt_tag}): {ckpt_path}")
-        load_state_dict_flexible(stn_model, ckpt_path, args.device)
+            print(f"\n{'─' * 40}")
+            print(f"  测试: {ckpt_name}")
+            if info:
+                print(f"  参数: {info}")
+            print(f"{'─' * 40}")
 
-        acc = stn_precise_testing(
-            stn_model=stn_model,
-            dataloader=test_dataloader,
-            device=args.device,
-            dataset_name=config_dataset,
-            precomputed_text_features=precomputed_text_features,
-            config=config,
-            model_tag=ckpt_tag,
-            visual_batches=args.visual_batches,
-            max_samples=max_samples,
-        )
+            load_state_dict_flexible(stn_model, ckpt_path, args.device)
+            print(f"  Model loaded successfully")
 
-        print("\n=== 测试汇总 ===")
-        print(f"{ckpt_tag}: {acc:.2f}%")
+            acc = stn_precise_testing(
+                stn_model=stn_model,
+                dataloader=test_dataloader,
+                device=args.device,
+                dataset_name=config_dataset,
+                precomputed_text_features=text_features,
+                config=config,
+                model_tag=tag,
+                visual_batches=args.visual_batches,
+                max_samples=max_samples,
+            )
+            results.append((ckpt_name, acc))
+
+        # 汇总
+        print(f"\n{'=' * 50}")
+        print(f"  测试汇总")
+        print(f"{'=' * 50}")
+        for name, acc in results:
+            print(f"  {acc:.2f}%  |  {name}")
+        if len(results) > 1:
+            best_name, best_acc = max(results, key=lambda x: x[1])
+            print(f"\n  最佳: {best_acc:.2f}% ({best_name})")
 
     except Exception as e:
-        print(f"\n❌ 测试失败: {e}")
+        print(f"\nTest failed: {e}")
         traceback.print_exc()
 
 

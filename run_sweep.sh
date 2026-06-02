@@ -21,6 +21,7 @@ set -e
 # ============================================================================
 # Conda 环境
 # ============================================================================
+CONDA_ENV="wca"
 CONDA_PYTHON="/mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/anaconda3/envs/wca/bin/python"
 
 # ============================================================================
@@ -137,9 +138,14 @@ echo "=============================================="
 echo ""
 
 TOTAL_EXPS=0
+COMPLETED=0
+FAILED=0
 declare -a ALL_RESULTS
 
 for EXP in "${EXPERIMENTS[@]}"; do
+    # 跳过空行和注释
+    [[ -z "$EXP" || "$EXP" == \#* ]] && continue
+
     read -r DATASET MODE REST <<< "$EXP"
 
     BASE_CONFIG="UN-STN-Config/${DATASET}.yaml"
@@ -213,14 +219,16 @@ print(f'  Config written')
             --num_workers $WORKERS \
             --seed 42 \
             >> "$EXP_LOG" 2>&1
+        TRAIN_EXIT=$?
 
         # 提取
+        BEST_LOSS=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)
         BEST_ACC_RAW=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Acc: [\d.]+' | sed 's/Acc: //' || true)
         BEST_ACC=$(awk "BEGIN {printf \"%.1f\", ${BEST_ACC_RAW:-0} * 100}")
         BEST_EP=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP '第\d+轮' | sed 's/第//;s/轮//' || true)
         TOTAL_EP=$(grep -c "Epoch [0-9]*/100" "$EXP_LOG" || true)
 
-        echo "  [训练] 完成" | tee -a "$EXP_LOG"
+        echo "  [训练] 退出码=$TRAIN_EXIT" | tee -a "$EXP_LOG"
 
         # 测试
         CKPT_DIR="checkpoints/unsupervised/${DATASET}"
@@ -241,9 +249,15 @@ print(f'  Config written')
             echo "  [测试] 未找到检查点" | tee -a "$EXP_LOG"
         fi
 
-        RESULT="${DATASET} | Grid | Ep=${TOTAL_EP:-?} | BestEp=${BEST_EP:-?} | ValAcc=${BEST_ACC:-?}% | TestAcc=${TEST_ACC:-N/A}%"
+        RESULT="${DATASET} | Grid | Ep=${TOTAL_EP:-?} | BestEp=${BEST_EP:-?} | ValAcc=${BEST_ACC:-?}% | TestAcc=${TEST_ACC:-N/A}% | BestLoss=${BEST_LOSS:-?}"
         ALL_RESULTS+=("$RESULT")
         echo "$RESULT" >> "$RESULTS_FILE"
+
+        if [ $TRAIN_EXIT -eq 0 ]; then
+            COMPLETED=$((COMPLETED + 1))
+        else
+            FAILED=$((FAILED + 1))
+        fi
 
         rm -f "$TEMP_CONFIG"
         pkill -f "train_unsupervised_ddp" 2>/dev/null || true
@@ -306,14 +320,16 @@ print(f'  Config: $YAML_PATH = {val}')
                 --num_workers $WORKERS \
                 --seed 42 \
                 >> "$EXP_LOG" 2>&1
+            TRAIN_EXIT=$?
 
             # 提取训练结果
+            TRAIN_BEST_LOSS=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)
             TRAIN_BEST_ACC_RAW=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Acc: [\d.]+' | sed 's/Acc: //' || true)
             TRAIN_BEST_ACC=$(awk "BEGIN {printf \"%.1f\", ${TRAIN_BEST_ACC_RAW:-0} * 100}")
             TRAIN_BEST_EP=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP '第\d+轮' | sed 's/第//;s/轮//' || true)
             TRAIN_TOTAL_EP=$(grep -c "Epoch [0-9]*/100" "$EXP_LOG" || true)
 
-            echo "  [训练] 完成" | tee -a "$EXP_LOG"
+            echo "  [训练] 退出码=$TRAIN_EXIT" | tee -a "$EXP_LOG"
 
             # 测试
             CKPT_DIR="checkpoints/unsupervised/${DATASET}"
@@ -335,9 +351,15 @@ print(f'  Config: $YAML_PATH = {val}')
                 echo "  [测试] 未找到检查点" | tee -a "$EXP_LOG"
             fi
 
-            RESULT="${DATASET} | ${YAML_PATH}=${VAL} | Ep=${TRAIN_TOTAL_EP:-?} | BestEp=${TRAIN_BEST_EP:-?} | ValAcc=${TRAIN_BEST_ACC:-?}% | TestAcc=${TEST_ACC:-N/A}%"
+            RESULT="${DATASET} | ${PARAM_SHORT}=${VAL} | Ep=${TRAIN_TOTAL_EP:-?} | BestEp=${TRAIN_BEST_EP:-?} | ValAcc=${TRAIN_BEST_ACC:-?}% | TestAcc=${TEST_ACC:-N/A}% | BestLoss=${TRAIN_BEST_LOSS:-?}"
             ALL_RESULTS+=("$RESULT")
             echo "$RESULT" >> "$RESULTS_FILE"
+
+            if [ $TRAIN_EXIT -eq 0 ]; then
+                COMPLETED=$((COMPLETED + 1))
+            else
+                FAILED=$((FAILED + 1))
+            fi
 
             rm -f "$TEMP_CONFIG"
             pkill -f "train_unsupervised_ddp" 2>/dev/null || true
@@ -353,9 +375,21 @@ echo ""
 echo "=============================================="
 echo "  全部完成"
 echo "=============================================="
-for r in "${ALL_RESULTS[@]}"; do
-    echo "  $r"
-done
+echo "总计: $TOTAL_EXPS | 成功: $COMPLETED | 失败: $FAILED"
 echo ""
+
+# 按数据集分组
+for ds in oxford_pets cub dtd food101; do
+    count=$(printf '%s\n' "${ALL_RESULTS[@]}" | grep -c "^${ds} |")
+    [[ $count -eq 0 ]] && continue
+    echo "━━━ $ds ━━━"
+    for r in "${ALL_RESULTS[@]}"; do
+        if [[ "$r" == "$ds |"* ]]; then
+            echo "  $r"
+        fi
+    done
+    echo ""
+done
+
 echo "📁 完整日志: $LOG_DIR/"
 echo "📁 汇总文件: $RESULTS_FILE"
