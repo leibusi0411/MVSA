@@ -49,6 +49,7 @@ declare -A PARAM_MAP=(
     ["fairness"]="stn_config.fairness_weight"
     ["lr"]="training.learning_rate"
     ["batch_size"]="training.batch_size"
+    ["clip_guidance_weight"]="stn_config.two_stage.clip_guidance_weight"
 )
 
 # ============================================================================
@@ -218,8 +219,7 @@ print(f'  Config written')
             --config $TEMP_CONFIG \
             --num_workers $WORKERS \
             --seed 42 \
-            >> "$EXP_LOG" 2>&1
-        TRAIN_EXIT=$?
+            >> "$EXP_LOG" 2>&1 && TRAIN_EXIT=0 || TRAIN_EXIT=$?
 
         # 提取
         BEST_LOSS=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)
@@ -265,7 +265,12 @@ print(f'  Config written')
 
     else
         # 单参数模式
-        YAML_PATH="$MODE"
+        # 短名 → 完整 YAML 路径
+        if [[ "$MODE" == *"."* ]]; then
+            YAML_PATH="$MODE"
+        else
+            YAML_PATH="${PARAM_MAP[$MODE]:-$MODE}"
+        fi
         VALUES_STR="$REST"
         PARAM_SHORT=$(echo "$YAML_PATH" | sed 's/.*\.//')
         IFS=',' read -ra VALUES <<< "$VALUES_STR"
@@ -319,8 +324,7 @@ print(f'  Config: $YAML_PATH = {val}')
                 --config $TEMP_CONFIG \
                 --num_workers $WORKERS \
                 --seed 42 \
-                >> "$EXP_LOG" 2>&1
-            TRAIN_EXIT=$?
+                >> "$EXP_LOG" 2>&1 && TRAIN_EXIT=0 || TRAIN_EXIT=$?
 
             # 提取训练结果
             TRAIN_BEST_LOSS=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)

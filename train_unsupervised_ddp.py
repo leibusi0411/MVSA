@@ -1107,8 +1107,8 @@ def main():
             
 
             if patience_counter >= patience:
-                print("🛑 早停触发，结束训练")
-                break
+                print("🛑 早停触发，等待同步...")
+                # 不在这里 break —— 通过下面的 broadcast 同步所有 rank 后再 break
 
         # 同步早停决定（确保所有进程同步）
         should_stop = False
