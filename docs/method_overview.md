@@ -1,170 +1,116 @@
-# STN-CLIP 无监督细粒度图像分类 — 方法概述
+# 无监督训练：数学推导
 
-## 1. 模型架构
+## 1. 符号约定
 
-```
-输入图像 448×448
-    │
-    ├──→ CLIP ViT-B/32 (冻结) ──→ global_CLS ──────────────┐
-    │                                                        │
-    └──→ LocalizationNetwork ──→ 4 个仿射变换 ──→ 4× crop   │
-           (可训练)              grid_sample        (224×224) │
-                                        │                     │
-                                        └──→ CLIP (冻结) ──→ 4 个 local_features
-                                                          │
-                                          ┌───────────────┘
-                                          │
-                                        FusionModule (可训练, Transformer)
-                                          │
-                                        fused_features [512]
-                                          │
-                                    × text_features [512, C]
-                                          │
-                                    fused_logits [C]
-```
+| 符号 | 维度 | 含义 |
+|------|------|------|
+| $g$ | $[B, D]$ | 冻结 CLIP 对原图 224×224 提取的全局 CLS 特征（L2 归一化） |
+| $f$ | $[B, D]$ | STN 多视角融合特征（L2 归一化） |
+| $\mathbf{v} = [v_1, \dots, v_N]$ | $[B, N, D]$ | N 个 STN 局部视角特征（各 L2 归一化） |
+| $\bar{v} = \frac{1}{N}\sum_i v_i$ | $[B, D]$ | N 个局部视角特征的平均 |
+| $\mathbf{T}$ | $[D, C]$ | 预计算的 C 个类别文本特征（L2 归一化） |
 
-**三个可训练组件**：
+**Logits 计算**（未经温度缩放）：
 
-- **LocalizationNetwork**: 1×1 卷积 → 空间卷积 → 池化 → MLP → 4 对 (x,y) 位置参数
-- **FusionModule**: Transformer 融合 4 个 local + 1 个 global → fused
-- **CLIP**: 全程冻结，作为特征提取器和外部知识源
-
-**测试时**：fused_logits × text_features → argmax → 预测类别
+$$
+\begin{aligned}
+z^g &= g \cdot \mathbf{T} \in \mathbb{R}^{B \times C} \quad &\text{全局 logits} \\
+z^f &= f \cdot \mathbf{T} \in \mathbb{R}^{B \times C} \quad &\text{融合 logits} \\
+z^v &= \mathbf{v} \cdot \mathbf{T} \in \mathbb{R}^{B \times N \times C} \quad &\text{多视角 logits}
+\end{aligned}
+$$
 
 ---
 
-## 2. 训练方法：两阶段
+## 2. 阶段一：Warmup（epoch 0 ~ warmup_epochs-1）
 
-### 阶段一（warmup, epoch 1-15）：冻结 CLIP 做 teacher
+让尚未训练的 STN 定位网络和融合模块从**冻结 CLIP 的全局知识**中快速学习。CLIP 编码器始终冻结。
 
-```
-Loss = KL(CLIP || local) + KL(CLIP || fused)
-```
+### Teacher 分布（$\tau_t = 0.05$）
 
-| 项 | 梯度流向 |
-|---|---------|
-| KL(CLIP.detach \|\| local) | CLIP(crop) → localization_network |
-| KL(CLIP.detach \|\| fused) | fusion_module → CLIP(crop) → localization_network |
+$$
+P_g = \text{softmax}(z^g / \tau_t) \in \mathbb{R}^{B \times C}
+$$
 
-两个模块同时从 CLIP 学习。teacher 温度 0.05，student 温度 0.09。
+### Local 分支（$\tau_s^w = 0.09$）
 
-### 阶段二（epoch 16+）：对称一致性 + CLIP 锚定
+每个局部视角向 CLIP 全局分布对齐。student 分布 $Q^v = \text{softmax}(z^v / \tau_s^w) \in \mathbb{R}^{B \times N \times C}$：
 
-```
-Loss = KL(fused.detach() || local)          ← Term 1: 全局教局部
-     + KL(local_mean.detach() || fused)     ← Term 2: 局部教融合
-     + 1.0 × KL(CLIP.detach() || fused)     ← Term 3: CLIP 锚定防坍缩
-```
+$$
+\mathcal{L}_{\text{local}} = \text{KL}(P_g \parallel Q^v)
+= \frac{1}{B \cdot N}\sum_{b=1}^{B}\sum_{i=1}^{N}\sum_{c=1}^{C} P_{g}(b,c) \cdot \log\frac{P_{g}(b,c)}{Q^v_{b,i,c}}
+$$
 
-| 项 | 梯度流向 |
-|---|---------|
-| Term 1 | localization_network |
-| Term 2 | fusion_module |
-| Term 3 | fusion_module → CLIP(crop) → localization_network |
+即逐视角 KL 后取平均。$P_g(b,c)$ 为第 $b$ 个样本对第 $c$ 类的 teacher 概率，$Q^v_{b,i,c}$ 为第 $b$ 个样本第 $i$ 个视角对第 $c$ 类的 student 概率。
 
-**设计原理**：
+### Fused 分支（$\tau_s^w = 0.09$）
 
-- **Term 1**：fused 综合了全图 + 4 crop 的信息，比单个 local 的认知更完整 → fused 教 local（全局指导局部）
-- **Term 2**：4 个 local 聚焦于不同区域，平均后提供多视角共识 → local 教 fused（多样性补充融合）
-- **Term 3**：CLIP 作为外部知识锚点，打破 fused↔local 闭环，防止两端合谋坍缩到平凡解
+融合特征向 CLIP 全局分布对齐。student 分布 $Q^f = \text{softmax}(z^f / \tau_s^w) \in \mathbb{R}^{B \times C}$：
 
-**detach 约定**：所有 teacher 方均 `.detach()`，梯度只流向 student 方。这是自蒸馏的标准做法，防止双向互追导致坍缩。
+$$
+\mathcal{L}_{\text{fused}} = \text{KL}(P_g \parallel Q^f)
+= \frac{1}{B}\sum_{b=1}^{B}\sum_{c=1}^{C} P_{g}(b,c) \cdot \log\frac{P_{g}(b,c)}{Q^f_{b,c}}
+$$
 
----
+### 阶段一总损失
 
-## 3. 温度设计
+$$
+\boxed{\mathcal{L}_{\text{stage1}} = \lambda_l \cdot \mathcal{L}_{\text{local}} + \lambda_f \cdot \mathcal{L}_{\text{fused}}}
+$$
 
-| 参数 | 阶段一 | 阶段二 |
-|------|--------|--------|
-| Teacher 侧 | teacher_temp=0.05 (CLIP) | 无（用 detach 后的分布） |
-| Student 侧 | warmup_student_temp=0.09 | dec_student_temp=0.15 (两路共享) |
-
-温度逻辑：teacher 尖锐（0.05）给强信号，student 平滑（0.09/0.15）给探索空间。
+其中 $\lambda_l = \lambda_f = 1.0$。
 
 ---
 
-## 4. 损失函数详情
+## 3. 阶段二：对称一致性（epoch ≥ warmup_epochs）
 
-### KL 散度计算
+阶段一结束后，fused 和 local 互相学习：
 
-```python
-# 单条 KL: KL(target || student)
-def _kl_from_logits(student_logits, target_probs, student_temp):
-    student_log_probs = log_softmax(student_logits / student_temp)
-    return kl_div(student_log_probs, target_probs, reduction='batchmean')
+- **fused → local**：融合特征综合了全图 + N 个裁剪块的信息，比单个 local view 的认知更完整，教定位网络
+- **local → fused**：N 个局部视角聚焦不同区域，平均后提供多视角共识，教融合模块
+- **CLIP 锚定**：打破 fused ↔ local 闭环，防止两端坍缩到平凡解
 
-# 多视角 KL: 对 N 个 local view 分别计算 KL 后取 batchmean
-def _multi_view_kl_from_logits(view_logits, target_probs, student_temp):
-    # view_logits: [B, N, C]
-    # 展平为 [B*N, C]，target 扩展为 [B*N, C]
-    return kl_div(log_softmax(view_logits_flat / student_temp),
-                  target_expand_flat, reduction='batchmean')
-```
+### 3.1 Fused → Local（教定位网络，$\tau_d = 0.15$）
 
-### 阶段一 loss
+$$
+P_f = \text{softmax}(z^f / \tau_d), \qquad
+Q^v = \text{softmax}(z^v / \tau_d)
+$$
 
-```python
-global_probs = softmax(CLIP_logits.detach() / 0.05)  # 尖锐 teacher 目标
+$$
+\mathcal{L}_{f \to l} = \text{KL}(P_f \parallel Q^v)
+= \frac{1}{B \cdot N}\sum_{b=1}^{B}\sum_{i=1}^{N}\sum_{c=1}^{C} P_{f}(b,c) \cdot \log\frac{P_{f}(b,c)}{Q^v_{b,i,c}}
+$$
 
-warmup_local = multi_view_kl(view_logits, global_probs, T=0.09)  # 每个 local → CLIP
-warmup_fused = kl(fused_logits, global_probs, T=0.09)            # fused → CLIP
+### 3.2 Local → Fused（教融合模块，$\tau_d = 0.15$）
 
-stage1_loss = 1.0 × warmup_local + 1.0 × warmup_fused
-```
+$$
+\bar{z}^v = \frac{1}{N}\sum_{i=1}^{N} z^v_i, \qquad
+P_v = \text{softmax}(\bar{z}^v / \tau_d), \qquad
+Q^f = \text{softmax}(z^f / \tau_d)
+$$
 
-### 阶段二 loss
+$$
+\mathcal{L}_{l \to f} = \text{KL}(P_v \parallel Q^f)
+= \frac{1}{B}\sum_{b=1}^{B}\sum_{c=1}^{C} P_{v}(b,c) \cdot \log\frac{P_{v}(b,c)}{Q^f_{b,c}}
+$$
 
-```python
-# Term 1: fused 教 local
-fused_probs = softmax(fused_logits.detach() / 0.15)
-dec_local = multi_view_kl(view_logits, fused_probs, T=0.15)
+### 3.3 CLIP 锚定（防坍缩，$\tau_t = 0.05$，$\tau_s^w = 0.09$）
 
-# Term 2: local 教 fused
-local_mean_logits = view_logits.mean(dim=1)  # [B, C]
-local_mean_probs = softmax(local_mean_logits.detach() / 0.15)
-dec_fused = kl(fused_logits, local_mean_probs, T=0.15)
+$$
+P_g = \text{softmax}(z^g / \tau_t), \qquad
+Q^f = \text{softmax}(z^f / \tau_s^w)
+$$
 
-# Term 3: CLIP 锚定
-clip_probs = softmax(CLIP_logits.detach() / 0.05)
-clip_guidance = kl(fused_logits, clip_probs, T=0.09)
+$$
+\mathcal{L}_{\text{clip}} = \text{KL}(P_g \parallel Q^f)
+= \frac{1}{B}\sum_{b=1}^{B}\sum_{c=1}^{C} P_{g}(b,c) \cdot \log\frac{P_{g}(b,c)}{Q^f_{b,c}}
+$$
 
-stage2_loss = dec_local + dec_fused + 1.0 × clip_guidance
-```
+### 3.4 阶段二总损失
 
----
+$$
+\boxed{\mathcal{L}_{\text{stage2}} = \mathcal{L}_{f \to l} + \mathcal{L}_{l \to f} + \lambda_{\text{clip}} \cdot \mathcal{L}_{\text{clip}}}
+$$
 
-## 5. 为什么阶段一有效但原始阶段二无效
-
-**根因**：原始阶段二 `KL(EMA(fused) || local)` 中 teacher = EMA(fused)，fused 在阶段二没有梯度来源：
-
-- EMA teacher 被 detach → fusion_module 断粮
-- local 追着一个锁死的 teacher → 学不到新东西
-- BestEpoch 永远停在 warmup 结束处
-
-**大量调试实验验证**：
-- 使用真实标签替代 teacher → 无效（fused 仍无梯度）
-- 调整 EMA 动量 (0.99/0.995/0.999) → 无差异
-- EMA vs Periodic 更新方式 → 无差异
-- 直接给 fused 做 CE 有监督 → 有效（证明关键在 fused 梯度）
-
-**修复**：Term 2（local→fused）给 fusion_module 梯度，Term 3（CLIP→fused）防止坍缩。
-
----
-
-## 6. 配置参数
-
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| model_size | ViT-B/32 | CLIP 骨干 |
-| num_views | 4 | STN 裁剪数量 |
-| fusion_mode | transformer | 融合模式 |
-| hidden_dim | 256 | 定位网络隐藏维度 |
-| batch_size | 64 (per GPU) | 双卡 DDP |
-| learning_rate | 5e-5 | AdamW |
-| warmup_epochs | 15 | 阶段一持续轮数 |
-| teacher_temp | 0.05 | CLIP teacher 温度 |
-| warmup_student_temp | 0.09 | 阶段一 student 温度 |
-| dec_student_temp | 0.15 | 阶段二 student 温度 |
-| clip_guidance_weight | 1.0 | 阶段二 CLIP 约束权重 |
-| epochs | 100 | 最大训练轮数 |
-| patience | 8 | 早停耐心 |
+其中 $\lambda_{\text{clip}} = 1.0$。

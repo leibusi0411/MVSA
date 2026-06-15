@@ -32,9 +32,9 @@ EXPERIMENTS=(
     # ============================================================
     # clip_guidance_weight（阶段二 CLIP 约束权重）
     # ============================================================
-    "oxford_pets clip_guidance_weight 0.1,0.5,1.0"
-    "cub         clip_guidance_weight 0.1,0.5,1.0"
-    "dtd         clip_guidance_weight 0.1,0.5,1.0"
+    "oxford_pets clip_guidance_weight 0.5,1.0,1.5"
+    "cub         clip_guidance_weight 0.5,1.0,1.5"
+    "dtd         clip_guidance_weight 0.5,1.0,1.5"
 )
 
 # ============================================================================
@@ -212,7 +212,7 @@ print(f'  Config written')
 " 2>&1 | tee -a "$EXP_LOG"
 
         echo "  [训练] 开始..."
-        $CONDA_PYTHON -u -m torch.distributed.run \
+        PYTHONUNBUFFERED=1 $CONDA_PYTHON -u -m torch.distributed.run \
             --nproc_per_node=$GPUS \
             train_unsupervised_ddp.py \
             --dataset $DATASET \
@@ -317,7 +317,7 @@ print(f'  Config: $YAML_PATH = {val}')
 
             # 训练
             echo "  [训练] 开始..."
-            $CONDA_PYTHON -u -m torch.distributed.run \
+            PYTHONUNBUFFERED=1 $CONDA_PYTHON -u -m torch.distributed.run \
                 --nproc_per_node=$GPUS \
                 train_unsupervised_ddp.py \
                 --dataset $DATASET \
