@@ -23,6 +23,7 @@ stn_config:
 
   # === 温度参数配置 ===
   logits_temp: 0.07
+  wca_temperature: 0.07      # WCA 局部视角加权温度
 
   # === 无监督损失权重配置 ===
   fairness_weight: 0.0           # 公平性正则化（centering 已够，禁用）
@@ -30,7 +31,7 @@ stn_config:
 
   # === 两阶段无监督训练配置 ===
   two_stage:
-    warmup_epochs: 15             # 阶段一持续的epoch数（细粒度任务可适当更长）
+    warmup_epochs: 18             # 阶段一持续的epoch数（细粒度任务可适当更长）
 
     # 阶段一参数（冻结CLIP teacher → Local + Fused）
     teacher_temp: 0.05   # CLIP教师温度 尖锐一点好           # 冻结CLIP teacher目标分布温度
@@ -42,6 +43,7 @@ stn_config:
     dec_student_temp: 0.15       # 两个KL共享的温度参数
     clip_guidance_weight: 1.0   # 阶段二 CLIP 约束权重 防止坍缩
     centering_momentum: 0.9   # teacher logits softmax前减去中心向量
+    use_confidence_weight: true   # 阶段一 CLIP 蒸馏时置信度加权（top-1 × margin）
 
 # === 训练配置 ===
 training:

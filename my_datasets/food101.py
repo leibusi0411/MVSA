@@ -57,7 +57,7 @@ class Food101(VisionDataset):
         )
         self.loader = loader
         self._split = verify_str_arg(split, "split", ("train", "val", "test"))
-        self._base_folder = Path(self.root) / "food-101"
+        self._base_folder = Path(self.root)
         self._meta_folder = self._base_folder / "meta"
         self._images_folder = self._base_folder / "images"
 

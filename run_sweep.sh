@@ -30,11 +30,12 @@ CONDA_PYTHON="/mnt/e3319bd7-a0cc-41a8-9825-36b781a06ce8/xzy/anaconda3/envs/wca/b
 # ============================================================================
 EXPERIMENTS=(
     # ============================================================
-    # clip_guidance_weight（阶段二 CLIP 约束权重）
+    # 置信度加权 vs 不加权 对比（阶段一 CLIP 蒸馏）
     # ============================================================
-    "oxford_pets clip_guidance_weight 0.1,0.5,1.0"
-    "cub         clip_guidance_weight 0.1,0.5,1.0"
-    "dtd         clip_guidance_weight 0.1,0.5,1.0"
+    # "cub         use_confidence_weight true,false"
+    "oxford_pets use_confidence_weight true,false"
+    # "dtd         use_confidence_weight true,false"
+    # "food101     use_confidence_weight true,false"
 )
 
 # ============================================================================
@@ -50,6 +51,7 @@ declare -A PARAM_MAP=(
     ["lr"]="training.learning_rate"
     ["batch_size"]="training.batch_size"
     ["clip_guidance_weight"]="stn_config.two_stage.clip_guidance_weight"
+    ["use_confidence_weight"]="stn_config.two_stage.use_confidence_weight"
 )
 
 # ============================================================================
@@ -193,13 +195,17 @@ with open('$BASE_CONFIG', 'r') as f:
 overrides = $OVERRIDES
 for key_path, val_str in overrides.items():
     parts = key_path.split('.')
-    try:
-        if '.' in val_str or 'e' in val_str.lower():
-            val = float(val_str)
-        else:
-            val = int(val_str)
-    except ValueError:
-        val = val_str
+    val_lower = val_str.strip().lower()
+    if val_lower in ('true', 'false'):
+        val = (val_lower == 'true')
+    else:
+        try:
+            if '.' in val_str or 'e' in val_str.lower():
+                val = float(val_str)
+            else:
+                val = int(val_str)
+        except ValueError:
+            val = val_str
     d = c
     for p in parts[:-1]:
         if p not in d: d[p] = {}
@@ -222,10 +228,13 @@ print(f'  Config written')
             >> "$EXP_LOG" 2>&1 && TRAIN_EXIT=0 || TRAIN_EXIT=$?
 
         # 提取
-        BEST_LOSS=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)
-        BEST_ACC_RAW=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Acc: [\d.]+' | sed 's/Acc: //' || true)
-        BEST_ACC=$(awk "BEGIN {printf \"%.1f\", ${BEST_ACC_RAW:-0} * 100}")
-        BEST_EP=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP '第\d+轮' | sed 's/第//;s/轮//' || true)
+        BEST_LINE=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 || true)
+        BEST_LOSS=$(echo "$BEST_LINE" | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)
+        BEST_FUSED_RAW=$(echo "$BEST_LINE" | grep -oP 'Fused: [\d.]+' | sed 's/Fused: //' || true)
+        BEST_LOCAL_RAW=$(echo "$BEST_LINE" | grep -oP 'Local: [\d.]+' | sed 's/Local: //' || true)
+        BEST_FUSED=$(awk "BEGIN {printf \"%.1f\", ${BEST_FUSED_RAW:-0} * 100}")
+        BEST_LOCAL=$(awk "BEGIN {printf \"%.1f\", ${BEST_LOCAL_RAW:-0} * 100}")
+        BEST_EP=$(echo "$BEST_LINE" | grep -oP '第\d+轮' | sed 's/第//;s/轮//' || true)
         TOTAL_EP=$(grep -c "Epoch [0-9]*/100" "$EXP_LOG" || true)
 
         echo "  [训练] 退出码=$TRAIN_EXIT" | tee -a "$EXP_LOG"
@@ -297,13 +306,17 @@ with open('$BASE_CONFIG', 'r') as f:
     config = yaml.safe_load(f)
 path = '$YAML_PATH'.split('.')
 val_str = '$VAL'
-try:
-    if '.' in val_str or 'e' in val_str.lower():
-        val = float(val_str)
-    else:
-        val = int(val_str)
-except ValueError:
-    val = val_str
+val_lower = val_str.strip().lower()
+if val_lower in ('true', 'false'):
+    val = (val_lower == 'true')
+else:
+    try:
+        if '.' in val_str or 'e' in val_str.lower():
+            val = float(val_str)
+        else:
+            val = int(val_str)
+    except ValueError:
+        val = val_str
 d = config
 for key in path[:-1]:
     if key not in d:
@@ -326,11 +339,14 @@ print(f'  Config: $YAML_PATH = {val}')
                 --seed 42 \
                 >> "$EXP_LOG" 2>&1 && TRAIN_EXIT=0 || TRAIN_EXIT=$?
 
-            # 提取训练结果
-            TRAIN_BEST_LOSS=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)
-            TRAIN_BEST_ACC_RAW=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP 'Acc: [\d.]+' | sed 's/Acc: //' || true)
-            TRAIN_BEST_ACC=$(awk "BEGIN {printf \"%.1f\", ${TRAIN_BEST_ACC_RAW:-0} * 100}")
-            TRAIN_BEST_EP=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 | grep -oP '第\d+轮' | sed 's/第//;s/轮//' || true)
+            # 提取训练结果（Fused + Local）
+            TRAIN_BEST_LINE=$(grep "新最佳Loss" "$EXP_LOG" | tail -1 || true)
+            TRAIN_BEST_LOSS=$(echo "$TRAIN_BEST_LINE" | grep -oP 'Loss: [\d.]+' | sed 's/Loss: //' || true)
+            TRAIN_BEST_FUSED_RAW=$(echo "$TRAIN_BEST_LINE" | grep -oP 'Fused: [\d.]+' | sed 's/Fused: //' || true)
+            TRAIN_BEST_LOCAL_RAW=$(echo "$TRAIN_BEST_LINE" | grep -oP 'Local: [\d.]+' | sed 's/Local: //' || true)
+            TRAIN_BEST_FUSED=$(awk "BEGIN {printf \"%.1f\", ${TRAIN_BEST_FUSED_RAW:-0} * 100}")
+            TRAIN_BEST_LOCAL=$(awk "BEGIN {printf \"%.1f\", ${TRAIN_BEST_LOCAL_RAW:-0} * 100}")
+            TRAIN_BEST_EP=$(echo "$TRAIN_BEST_LINE" | grep -oP '第\d+轮' | sed 's/第//;s/轮//' || true)
             TRAIN_TOTAL_EP=$(grep -c "Epoch [0-9]*/100" "$EXP_LOG" || true)
 
             echo "  [训练] 退出码=$TRAIN_EXIT" | tee -a "$EXP_LOG"
@@ -341,21 +357,23 @@ print(f'  Config: $YAML_PATH = {val}')
 
             if [ -n "$BEST_CKPT" ]; then
                 echo "  [测试] $(basename "$BEST_CKPT")"
-                TEST_OUTPUT=$($CONDA_PYTHON test_unsupervised_stn.py \
+                TEST_OUTPUT=$($CONDA_PYTHON test_unsupervised_local.py \
                     --dataset_name $DATASET \
                     --ckpt_path "$BEST_CKPT" \
                     --visual_batches 0 \
                     --batch_size 64 \
                     2>&1)
-                TEST_ACC=$(echo "$TEST_OUTPUT" | grep "Top-1 Acc:" | tail -1 | grep -oP '[\d.]+(?=%)')
+                TEST_FUSED=$(echo "$TEST_OUTPUT" | grep "Fused.*Top-1 Acc:" | grep -oP '[\d.]+(?=%)')
+                TEST_LOCAL=$(echo "$TEST_OUTPUT" | grep "Local.*Acc:" | grep -oP '[\d.]+(?=%)')
                 echo "$TEST_OUTPUT" >> "$EXP_LOG"
-                echo "  [测试] Acc: ${TEST_ACC:-N/A}%" | tee -a "$EXP_LOG"
+                echo "  [测试] Fused: ${TEST_FUSED:-N/A}%, Local: ${TEST_LOCAL:-N/A}%" | tee -a "$EXP_LOG"
             else
-                TEST_ACC="N/A"
+                TEST_FUSED="N/A"
+                TEST_LOCAL="N/A"
                 echo "  [测试] 未找到检查点" | tee -a "$EXP_LOG"
             fi
 
-            RESULT="${DATASET} | ${PARAM_SHORT}=${VAL} | Ep=${TRAIN_TOTAL_EP:-?} | BestEp=${TRAIN_BEST_EP:-?} | ValAcc=${TRAIN_BEST_ACC:-?}% | TestAcc=${TEST_ACC:-N/A}% | BestLoss=${TRAIN_BEST_LOSS:-?}"
+            RESULT="${DATASET} | ${PARAM_SHORT}=${VAL} | Ep=${TRAIN_TOTAL_EP:-?} | BestEp=${TRAIN_BEST_EP:-?} | ValFused=${TRAIN_BEST_FUSED:-?}% | ValLocal=${TRAIN_BEST_LOCAL:-?}% | TestFused=${TEST_FUSED:-N/A}% | TestLocal=${TEST_LOCAL:-N/A}%"
             ALL_RESULTS+=("$RESULT")
             echo "$RESULT" >> "$RESULTS_FILE"
 

@@ -20,12 +20,13 @@ stn_config:
   transformer_dropout: 0.1
 
   logits_temp: 0.07   #只做准确率计算
+  wca_temperature: 0.07   # WCA 局部视角加权温度
 
   fairness_weight: 0.0
   decorrelation_weight: 0.0
 
   two_stage:
-    warmup_epochs: 15
+    warmup_epochs: 18
 
     teacher_temp: 0.05   #CLIP教师温度参数  尖锐一点好   教师比学生尖锐一点
     warmup_student_temp: 0.09   # local 和 fused 共用  学生温度参数
@@ -36,6 +37,7 @@ stn_config:
     dec_student_temp: 0.15
     clip_guidance_weight: 1.0   # 阶段二 CLIP 约束权重 防止坍缩
     centering_momentum: 0.9   # teacher logits softmax前减去中心向量
+    use_confidence_weight: true   # 阶段一 CLIP 蒸馏时置信度加权（top-1 × margin）
 
 # === 训练配置 ===
 training:

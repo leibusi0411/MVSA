@@ -205,7 +205,9 @@ class MultiViewSTNModel(nn.Module):
                 'view_images': view_images,           # [B, N, 3, 224, 224] 变换后的图像
                 'position_params': position_params,   # [B, 2*N] 位置参数
                 'theta_matrices': theta_matrices,     # [B, N, 2, 3] 变换矩阵
-                'num_views': self.num_views          # 视角数量
+                'num_views': self.num_views,          # 视角数量
+                'view_features': multi_view_features,  # [B, N, D] STN局部视角特征
+                'original_features': original_features,  # [B, D] 原始全局特征
             }
             return fused_features, vis_data
         else:

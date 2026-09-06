@@ -64,7 +64,7 @@ class DTD(VisionDataset):
         )
         self.loader = loader
         self._base_folder = (
-            pathlib.Path(self.root) / type(self).__name__.lower()
+            pathlib.Path(self.root)
         )
         self._data_folder = self._base_folder / "dtd"
         self._meta_folder = self._data_folder / "labels"
