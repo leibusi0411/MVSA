@@ -295,6 +295,12 @@ def get_two_stage_config(config: dict) -> dict:
         'clip_guidance_weight': float(two_stage.get('clip_guidance_weight', 1.0)),
         # 置信度加权（top-1 × margin），仅阶段一 CLIP 蒸馏时生效
         'use_confidence_weight': _parse_bool(two_stage.get('use_confidence_weight', True)),
+        # 零参数文本条件化 teacher（tc）：伪标签文本引导的 patch 池化分布作为额外蒸馏目标
+        # 仅训练期辅助、无可训练参数，权重为 0 即关闭
+        'tc_fused_weight': float(two_stage.get('tc_fused_weight', 0.0)),
+        'tc_local_weight': float(two_stage.get('tc_local_weight', 0.0)),
+        'tc_pool_temp': float(two_stage.get('tc_pool_temp', 0.07)),
+        'tc_teacher_temp': float(two_stage.get('tc_teacher_temp', 0.05)),
     }
 
 
@@ -319,6 +325,12 @@ def build_unsupervised_model_name(dataset_name: str, config: dict) -> str:
         f"_kl{stage2_kl_weight:.2f}"
         f"_cg{clip_guidance_weight:.2f}"
     )
+
+    # 文本条件化 teacher 实验标识（仅启用时追加）
+    tc_fused_weight = float(two_stage_cfg.get('tc_fused_weight', 0.0))
+    tc_local_weight = float(two_stage_cfg.get('tc_local_weight', 0.0))
+    if tc_fused_weight > 0 or tc_local_weight > 0:
+        loss_suffix += f"_tcf{tc_fused_weight:.2f}l{tc_local_weight:.2f}"
 
     if stn_cfg.get('fairness_weight', 0.0) > 0:
         loss_suffix += f"_fair{stn_cfg.get('fairness_weight', 0.0)}"
@@ -415,6 +427,44 @@ def compute_global_logits(model_without_ddp,
     return global_logits_raw
 
 
+def compute_tc_teacher_probs(clip_visual,
+                             patch_tokens: torch.Tensor,
+                             text_features: torch.Tensor,
+                             global_logits_raw: torch.Tensor,
+                             pool_temp: float,
+                             teacher_temp: float) -> torch.Tensor:
+    """
+    零参数文本条件化（text-conditioned, tc）teacher 分布。
+
+    流程：冻结 CLIP 全局预测的 top-1 伪标签类文本特征作为 query，对 ViT patch tokens
+    做余弦相似度加权池化，得到"聚焦类别相关区域"的视觉特征，再与全类文本特征计算
+    相似度分布，作为空间聚焦版的辅助蒸馏目标。
+
+    全程 no_grad、无可训练参数（ln_post/proj 均为冻结 CLIP 自带权重），
+    仅训练期使用，推理路径不涉及。
+    """
+    with torch.no_grad():
+        # patch tokens 补上冻结 CLIP 自带的 ln_post + proj，映射到图文对齐空间
+        patches = clip_visual.ln_post(patch_tokens.detach().float())     # [B, P, width]
+        if clip_visual.proj is not None:
+            patches = patches @ clip_visual.proj                         # [B, P, D]
+        patches = F.normalize(patches, dim=-1)
+
+        # 伪标签类别文本特征作为 query（text_features: [D, C]）
+        pseudo = global_logits_raw.argmax(dim=-1)                        # [B]
+        t_q = F.normalize(text_features[:, pseudo].t().float(), dim=-1)  # [B, D]
+
+        # 文本引导池化：patch 与 query 的余弦相似度（两侧均已归一化）→ softmax 权重
+        attn = F.softmax(
+            torch.einsum('bpd,bd->bp', patches, t_q) / max(pool_temp, 1e-6), dim=-1
+        )                                                                # [B, P]
+        v_tc = F.normalize(torch.einsum('bp,bpd->bd', attn, patches), dim=-1)  # [B, D]
+
+        tc_logits = v_tc @ text_features.float()                         # [B, C]
+        tc_probs = F.softmax(tc_logits / max(teacher_temp, 1e-6), dim=-1)
+    return tc_probs
+
+
 def compute_two_stage_unsupervised_loss(criterion,
                                         fused_features: torch.Tensor,
                                         view_features: torch.Tensor,
@@ -423,11 +473,17 @@ def compute_two_stage_unsupervised_loss(criterion,
                                         global_logits_raw: torch.Tensor,
                                         epoch: int,
                                         global_step: int,
-                                        config: dict):
+                                        config: dict,
+                                        patch_tokens: torch.Tensor = None,
+                                        clip_visual=None):
     """
     两阶段无监督目标：
     - 阶段一（warmup）：Global -> Local + Global -> Fused
     - 阶段二（periodic）：周期刷新teacher分布，最小化 Local <- Fused_teacher
+
+    可选辅助蒸馏：当 two_stage.tc_fused_weight / tc_local_weight > 0 且提供了
+    patch_tokens 与 clip_visual 时，追加零参数文本条件化（tc）teacher 的 KL 项
+    （tc 分布全程 detach，只作为 teacher，不引入可训练参数）。
     """
     if view_features is None:
         raise ValueError("两阶段训练需要 view_features，当前为 None")
@@ -448,6 +504,10 @@ def compute_two_stage_unsupervised_loss(criterion,
         'warmup_local_weighted': 0.0,
         'warmup_fused': 0.0,
         'warmup_fused_weighted': 0.0,
+        'tc_local': 0.0,
+        'tc_local_weighted': 0.0,
+        'tc_fused': 0.0,
+        'tc_fused_weighted': 0.0,
         'dec_local': 0.0,
         'dec_local_weighted': 0.0,
         'dec_fused': 0.0,
@@ -480,6 +540,21 @@ def compute_two_stage_unsupervised_loss(criterion,
             gamma = gamma.detach()
     else:
         gamma = None
+
+    # === 零参数文本条件化（tc）teacher 分布（权重>0 且提供 patch tokens 时启用） ===
+    tc_fused_weight = float(two_stage_cfg.get('tc_fused_weight', 0.0))
+    tc_local_weight = float(two_stage_cfg.get('tc_local_weight', 0.0))
+    tc_probs = None
+    if (tc_fused_weight > 0.0 or tc_local_weight > 0.0) \
+            and patch_tokens is not None and clip_visual is not None:
+        tc_probs = compute_tc_teacher_probs(
+            clip_visual=clip_visual,
+            patch_tokens=patch_tokens,
+            text_features=text_features,
+            global_logits_raw=global_logits_raw,
+            pool_temp=two_stage_cfg.get('tc_pool_temp', 0.07),
+            teacher_temp=two_stage_cfg.get('tc_teacher_temp', 0.05),
+        )
 
     # === 阶段损失 ===
     if epoch < two_stage_cfg['warmup_epochs']:
@@ -515,6 +590,39 @@ def compute_two_stage_unsupervised_loss(criterion,
             two_stage_cfg['warmup_local_weight'] * warmup_local +
             two_stage_cfg['warmup_fused_weight'] * warmup_fused
         )
+
+        # 文本条件化 teacher 蒸馏（tc → local / tc → fused），沿用置信度门控
+        if tc_probs is not None:
+            tc_student_temp = two_stage_cfg['warmup_student_temp']
+            if use_conf_weight:
+                tc_local = _weighted_multi_view_kl_from_logits(
+                    view_logits=view_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=tc_student_temp,
+                    sample_weights=gamma,
+                )
+                tc_fused = _weighted_kl_from_logits(
+                    student_logits=fused_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=tc_student_temp,
+                    sample_weights=gamma,
+                )
+            else:
+                tc_local = _multi_view_kl_from_logits(
+                    view_logits=view_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=tc_student_temp,
+                )
+                tc_fused = _kl_from_logits(
+                    student_logits=fused_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=tc_student_temp,
+                )
+            stage_loss = stage_loss + tc_local_weight * tc_local + tc_fused_weight * tc_fused
+            loss_details['tc_local'] = float(tc_local.item())
+            loss_details['tc_local_weighted'] = float((tc_local_weight * tc_local).item())
+            loss_details['tc_fused'] = float(tc_fused.item())
+            loss_details['tc_fused_weighted'] = float((tc_fused_weight * tc_fused).item())
 
         loss_details['phase'] = 'warmup'
         loss_details['warmup_local'] = float(warmup_local.item())
@@ -556,6 +664,39 @@ def compute_two_stage_unsupervised_loss(criterion,
         weighted_clip_guidance = clip_guidance_weight * clip_guidance
 
         stage_loss = dec_local + dec_fused + weighted_clip_guidance
+
+        # 文本条件化 teacher 蒸馏（tc → local / tc → fused），沿用置信度门控
+        if tc_probs is not None:
+            if use_conf_weight:
+                tc_local = _weighted_multi_view_kl_from_logits(
+                    view_logits=view_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=dec_student_temp,
+                    sample_weights=gamma,
+                )
+                tc_fused = _weighted_kl_from_logits(
+                    student_logits=fused_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=dec_student_temp,
+                    sample_weights=gamma,
+                )
+            else:
+                tc_local = _multi_view_kl_from_logits(
+                    view_logits=view_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=dec_student_temp,
+                )
+                tc_fused = _kl_from_logits(
+                    student_logits=fused_logits_raw,
+                    target_probs=tc_probs,
+                    student_temp=dec_student_temp,
+                )
+            stage_loss = stage_loss + tc_local_weight * tc_local + tc_fused_weight * tc_fused
+            loss_details['tc_local'] = float(tc_local.item())
+            loss_details['tc_local_weighted'] = float((tc_local_weight * tc_local).item())
+            loss_details['tc_fused'] = float(tc_fused.item())
+            loss_details['tc_fused_weighted'] = float((tc_fused_weight * tc_fused).item())
+
         loss_details['phase'] = 'dec_symmetric'
         loss_details['dec_local'] = float(dec_local.item())
         loss_details['dec_local_weighted'] = float(dec_local.item())
@@ -647,10 +788,12 @@ def unsupervised_train_one_epoch(model: DDP,
         global_step = epoch * len(train_loader) + batch_idx
 
         # 前向传播：复用模型内部已提取的原图CLS特征，避免重复提取全局特征
-        fused_features, view_features, original_features = model(
+        # 同时取出 patch tokens，供零参数文本条件化（tc）teacher 使用
+        fused_features, view_features, original_features, patch_features = model(
             images,
             mode='train',
             return_original_features=True,
+            return_patch_features=True,
         )
         global_logits_raw = torch.matmul(original_features, text_features)
 
@@ -665,6 +808,8 @@ def unsupervised_train_one_epoch(model: DDP,
             epoch=epoch,
             global_step=global_step,
             config=config,
+            patch_tokens=patch_features,
+            clip_visual=model_without_ddp.clip_model.visual,
         )
 
         # 仅用于监控准确率
@@ -712,6 +857,10 @@ def unsupervised_train_one_epoch(model: DDP,
                 progress_dict['WFus'] = f"{loss_details.get('warmup_fused', 0.0):.3f}/{loss_details.get('warmup_fused_weighted', 0.0):.3f}"
             elif loss_details.get('phase') == 'dec_periodic':
                 progress_dict['DecP'] = f"{loss_details.get('dec_local', 0.0):.3f}/{loss_details.get('dec_local_active', 0.0):.3f}"
+
+            # 显示文本条件化 teacher 损失分量（启用时）
+            if two_stage_cfg.get('tc_fused_weight', 0.0) > 0 or two_stage_cfg.get('tc_local_weight', 0.0) > 0:
+                progress_dict['TC'] = f"{loss_details.get('tc_fused', 0.0):.3f}/{loss_details.get('tc_fused_weighted', 0.0):.3f}"
 
             # 显示正则项损失分量
             if getattr(criterion, 'classification_weight', 0.0) > 0:
@@ -772,6 +921,7 @@ def unsupervised_validate(model: DDP,
 
     temperature = float(config['stn_config'].get('logits_temp', 0.07))
     wca_temperature = float(config['stn_config'].get('wca_temperature', 0.07))
+    two_stage_cfg = get_two_stage_config(config)
     total_loss_sum = 0.0
     total_correct = 0
     total_local_correct = 0
@@ -788,10 +938,11 @@ def unsupervised_validate(model: DDP,
             global_step = epoch * len(val_loader) + batch_idx
 
             # 验证时复用模型内部原图CLS特征，避免重复提取
-            fused_features, view_features, original_features = model(
+            fused_features, view_features, original_features, patch_features = model(
                 images,
                 mode='train',
                 return_original_features=True,
+                return_patch_features=True,
             )
             global_logits_raw = torch.matmul(original_features, text_features)
 
@@ -805,6 +956,8 @@ def unsupervised_validate(model: DDP,
                 epoch=epoch,
                 global_step=global_step,
                 config=config,
+                patch_tokens=patch_features,
+                clip_visual=model_without_ddp.clip_model.visual,
             )
 
             similarity = fused_logits_raw / temperature
@@ -831,6 +984,8 @@ def unsupervised_validate(model: DDP,
                     progress_dict['wfus'] = f"{loss_details.get('warmup_fused', 0.0):.3f}/{loss_details.get('warmup_fused_weighted', 0.0):.3f}"
                 else:
                     progress_dict['decp'] = f"{loss_details.get('dec_local', 0.0):.3f}/{loss_details.get('dec_local_weighted', 0.0):.3f}"
+                if two_stage_cfg.get('tc_fused_weight', 0.0) > 0 or two_stage_cfg.get('tc_local_weight', 0.0) > 0:
+                    progress_dict['tc'] = f"{loss_details.get('tc_fused', 0.0):.3f}/{loss_details.get('tc_fused_weighted', 0.0):.3f}"
                 if getattr(criterion, 'classification_weight', 0.0) > 0:
                     progress_dict['cls'] = f"{loss_details.get('classification', 0.0):.3f}/{loss_details.get('classification_weighted', 0.0):.3f}"
                 if getattr(criterion, 'fairness_weight', 0.0) > 0:

@@ -56,6 +56,7 @@ python test_unsupervised_stn.py --dataset_name cub --visual_batches 3 --max_vis_
 无监督训练（`train_unsupervised_ddp.py`）有自己独立的 `compute_two_stage_unsupervised_loss`，绕过 `MultiViewSTNLoss.forward()`，直接计算 KL 损失：
 - **阶段一（预热）**：KL(global || local) + KL(global || fused)，其中 global 来自冻结 CLIP 对 224 图像的编码
 - **阶段二（周期性目标）**：每 N 个 epoch 刷新一个教师 MultiViewSTNModel；其融合预测作为 KL(teacher || local_views) 的目标
+- **可选：零参数文本条件化（tc）teacher**（`two_stage.tc_fused_weight` / `tc_local_weight` > 0 时启用，默认 0 关闭）：用冻结 CLIP 全局预测的伪标签类文本特征作 query，对 ViT patch tokens 做余弦相似度加权池化（复用冻结的 `ln_post`/`proj`），产出空间聚焦的辅助蒸馏分布 KL(tc || local) + KL(tc || fused)，逐样本乘置信度 gamma。全程无可训练参数、teacher 侧 detach，仅训练期使用，推理路径不涉及
 
 ### 数据流水线（`data_preprocess.py`）
 

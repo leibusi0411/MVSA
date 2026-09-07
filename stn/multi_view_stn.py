@@ -130,10 +130,10 @@ class MultiViewSTNModel(nn.Module):
         print(f"    🔒 CLIP模型参数已冻结: {frozen_params:,} 个参数")
         print(f"    🎯 可训练STN参数: {trainable_params:,} 个参数")
     
-    def forward(self, images_448, mode='train', return_original_features=False):
+    def forward(self, images_448, mode='train', return_original_features=False, return_patch_features=False):
         """
-        多视角STN前向传播 
-        
+        多视角STN前向传播
+
         Args:
             images_448 (torch.Tensor): 输入图像 [B, 3, 448, 448]
             mode (str): 运行模式
@@ -143,12 +143,19 @@ class MultiViewSTNModel(nn.Module):
                           用于测试阶段，需要可视化数据
             return_original_features (bool): 仅在 mode='train' 时生效。
                 为 True 时额外返回原图CLS全局特征（已L2归一化），用于上层复用避免重复编码。
-            
+            return_patch_features (bool): 仅在 mode='train' 时生效。
+                为 True 时额外返回 ViT patch tokens（未过 ln_post/proj，未归一化），
+                用于文本条件化 teacher 等纯训练期辅助损失，推理路径不使用。
+                开启时会同时返回 original_features（隐含 return_original_features=True）。
+
         Returns:
             根据 mode 返回不同内容：
             - mode='train': (fused_features [B, D], view_features [B, N, D])
               当 return_original_features=True 时返回
               (fused_features [B, D], view_features [B, N, D], original_features [B, D])
+              当 return_patch_features=True 时返回
+              (fused_features [B, D], view_features [B, N, D], original_features [B, D],
+               patch_features [B, num_patches, patch_dim])
             - mode='test': (fused_features [B, D], vis_data dict)
         """
         batch_size = images_448.size(0)
@@ -164,7 +171,7 @@ class MultiViewSTNModel(nn.Module):
         # 2. 对patch tokens进行平均池化得到空间特征
         # 3. 通过MLP预测所有视角的位置参数
         # 同时返回CLS特征用于后续复用
-        position_params, cls_features = self.localization_network(preprocessed_images)  # [B, 2*N], [B, D]
+        position_params, cls_features, patch_features = self.localization_network(preprocessed_images)  # [B, 2*N], [B, D], [B, num_patches, patch_dim]
         
         # 内存优化：立即释放预处理图像
         del preprocessed_images
@@ -196,6 +203,8 @@ class MultiViewSTNModel(nn.Module):
         # === 步骤6：根据模式返回不同结果 ===
         if mode == 'train':
             # 训练/验证模式：返回融合特征和多视角特征（用于损失计算）
+            if return_patch_features:
+                return fused_features, multi_view_features, original_features, patch_features
             if return_original_features:
                 return fused_features, multi_view_features, original_features
             return fused_features, multi_view_features
@@ -304,15 +313,17 @@ class SharedLocalizationNetwork(nn.Module):
     
     def forward(self, preprocessed_images):
         """
-        预测所有视角的位置参数，同时返回CLIP的CLS特征
-        
+        预测所有视角的位置参数，同时返回CLIP的CLS特征和patch tokens
+
         Args:
             preprocessed_images (torch.Tensor): CLIP预处理图像 [B, 3, 224, 224]
-            
+
         Returns:
-            tuple: (position_params, cls_features)
+            tuple: (position_params, cls_features, patch_features)
                 - position_params (torch.Tensor): 位置参数 [B, 2*N]
                 - cls_features (torch.Tensor): CLIP CLS特征 [B, D]
+                - patch_features (torch.Tensor): ViT patch tokens [B, num_patches, patch_dim]
+                  （未过 ln_post/proj，仅供训练期辅助损失使用）
         """
         batch_size = preprocessed_images.size(0)
         
@@ -360,7 +371,7 @@ class SharedLocalizationNetwork(nn.Module):
         # 将范围从[-1, 1]缩放到[-0.5, 0.5]，防止视角超出图片边界
         # position_params = position_params * 0.5
         
-        return position_params, cls_features
+        return position_params, cls_features, patch_features
 
     def get_transformation_matrices(self, position_params):
         """

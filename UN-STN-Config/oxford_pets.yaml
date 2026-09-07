@@ -39,6 +39,14 @@ stn_config:
     centering_momentum: 0.9   # teacher logits softmax前减去中心向量
     use_confidence_weight: true   # 阶段一 CLIP 蒸馏时置信度加权（top-1 × margin）
 
+    # === 零参数文本条件化 teacher（tc）===
+    # 伪标签类文本特征引导的 patch 池化分布作为额外蒸馏目标，仅训练期辅助、无可训练参数
+    # 权重为 0 即关闭；推理路径不涉及
+    tc_fused_weight: 0.0        # KL(tc → Fused) 权重
+    tc_local_weight: 0.0        # KL(tc → Local) 权重
+    tc_pool_temp: 0.07          # patch 池化注意力温度
+    tc_teacher_temp: 0.05       # tc teacher 分布温度
+
 # === 训练配置 ===
 training:
   epochs: 100

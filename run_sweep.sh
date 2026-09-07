@@ -52,6 +52,10 @@ declare -A PARAM_MAP=(
     ["batch_size"]="training.batch_size"
     ["clip_guidance_weight"]="stn_config.two_stage.clip_guidance_weight"
     ["use_confidence_weight"]="stn_config.two_stage.use_confidence_weight"
+    ["tc_fused"]="stn_config.two_stage.tc_fused_weight"
+    ["tc_local"]="stn_config.two_stage.tc_local_weight"
+    ["tc_pool_temp"]="stn_config.two_stage.tc_pool_temp"
+    ["tc_temp"]="stn_config.two_stage.tc_teacher_temp"
 )
 
 # ============================================================================
